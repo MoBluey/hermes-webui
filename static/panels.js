@@ -6984,6 +6984,8 @@ async function switchToProfile(name) {
   // doesn't pre-check) can't flash a skeleton→restore for a click that changes
   // nothing. (#4662 Opus gate)
   if (name && name === S.activeProfile) return true;
+  if (typeof window._voiceModeActive === 'function' && window._voiceModeActive()
+      && typeof window._voiceModeDeactivate === 'function') window._voiceModeDeactivate();
   S._pendingSessionToolsets=null;
   // Profile switches are per-client cookie/TLS scoped, so a running stream in
   // the current session can safely continue while this tab moves to another

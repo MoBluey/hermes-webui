@@ -1535,11 +1535,7 @@ window.renderTranscript=function(container, messages, opts){
 // Chained flow: listen → send → (agent processes) → TTS response → listen again
 (function(){
   const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
-  const hasSTT=!(!SpeechRecognition);
-  const hasTTS=!!('speechSynthesis' in window);
-
-  // Need both STT and TTS for turn-based voice mode
-  if(!hasSTT||!hasTTS) return;
+  const _mediaVoiceFactory=window.createHermesVoiceModeMediaCapture;
 
   const modeBtn=$('btnVoiceMode');
   const bar=$('voiceModeBar');
@@ -1561,25 +1557,41 @@ window.renderTranscript=function(container, messages, opts){
   }
   let _voiceModeActive=false;
 
+  function _voiceModeCanSpeak(){
+    const engine=localStorage.getItem('hermes-tts-engine')||'browser';
+    if(engine==='browser') return !!(window.speechSynthesis&&window.SpeechSynthesisUtterance);
+    if(engine==='edge'||engine==='elevenlabs'||engine==='openai') return true;
+    return typeof window._hermesTtsIsRegistered==='function'&&window._hermesTtsIsRegistered(engine);
+  }
+
+  function _voiceModeCanListen(){
+    return !!SpeechRecognition||!!(_mediaCapture&&_mediaCapture.supported());
+  }
+
   function _applyVoiceModePref(){
     const enabled = _voiceModePrefEnabled();
-    modeBtn.style.display = enabled ? '' : 'none';
-    if(!enabled && _voiceModeActive) _deactivate();
+    const usable=_voiceModeCanListen()&&_voiceModeCanSpeak();
+    modeBtn.style.display = enabled&&usable ? '' : 'none';
+    if((!enabled||!usable)&&_voiceModeActive) _deactivate();
   }
-  _applyVoiceModePref();
   // Expose so the settings pane can re-apply immediately on toggle.
   window._applyVoiceModePref = _applyVoiceModePref;
 
   let _voiceModeState='idle'; // idle | listening | thinking | speaking
   let _recognition=null;
+  let _mediaCapture=null;
   let _silenceTimer=null;
   // Capture the session id at thinking-time so the TTS callback won't read
   // a different session's last assistant reply if the user navigated away
   // between send and stream completion. (Opus pre-release advisor.)
   let _voiceModeThinkingSid=null;
+  let _voiceModeGeneration=0;
+  let _voiceModeAudioUrl=null;
   let _browserTtsKeepAlive=null;
   let _browserTtsWatchdog=null;
   let _browserTtsSuppressNextErrorRearm=false;
+  let _browserTtsGeneration=null;
+  let _browserTtsSessionId=null;
   // Configurable via localStorage keys (set from dev console or a future settings panel).
   //   hermes-voice-silence-ms, pause duration before auto-send (ms, default 1800)
   //   hermes-voice-continuous, keep mic open across natural pauses ("true"/"false", default false)
@@ -1587,6 +1599,72 @@ window.renderTranscript=function(container, messages, opts){
     const _silenceMsRaw=parseInt(localStorage.getItem('hermes-voice-silence-ms'),10);
     return (Number.isFinite(_silenceMsRaw)&&_silenceMsRaw>0)?Math.max(200,_silenceMsRaw):1800;
   }
+
+  function _voiceModeSessionId(){
+    return (typeof S!=='undefined'&&S.session)?S.session.session_id:null;
+  }
+
+  function _voiceModeRunIsCurrent(generation,sessionId){
+    return _voiceModeActive&&generation===_voiceModeGeneration&&_voiceModeSessionId()===sessionId;
+  }
+
+  function _voiceModeResumeAfterPlayback(generation,sessionId,delay){
+    if(!_voiceModeRunIsCurrent(generation,sessionId)) return;
+    setTimeout(()=>{
+      if(_voiceModeRunIsCurrent(generation,sessionId)&&_voiceModeState==='speaking') _startListening();
+    },delay);
+  }
+
+  function _voiceModeFinishAudio(audio,url,generation,sessionId,delay){
+    const ownsPlayback=_playingEdgeAudio===audio;
+    const ownsRun=_voiceModeRunIsCurrent(generation,sessionId);
+    if(ownsPlayback&&ownsRun){
+      _playingEdgeAudio=null;
+      _ttsSpeaking=false;
+    }
+    if(url&&_voiceModeAudioUrl===url){
+      URL.revokeObjectURL(url);
+      _voiceModeAudioUrl=null;
+    }
+    if(ownsPlayback&&ownsRun) _voiceModeResumeAfterPlayback(generation,sessionId,delay);
+  }
+
+  function _voiceModeSynthesisFailed(generation,sessionId){
+    if(!_voiceModeRunIsCurrent(generation,sessionId)) return;
+    _ttsSpeaking=false;
+    _voiceModeResumeAfterPlayback(generation,sessionId,1000);
+  }
+
+  if(typeof _mediaVoiceFactory==='function'){
+    _mediaCapture=_mediaVoiceFactory({
+      getSilenceMs:_voiceSilenceMs,
+      getSessionId:_voiceModeSessionId,
+      onTranscript:(text,sessionId)=>{
+        if(!_voiceModeActive||_voiceModeState!=='listening'||_voiceModeSessionId()!==sessionId) return;
+        ta.value=text;
+        autoResize();
+        _voiceModeSend();
+      },
+      onEmpty:(sessionId)=>{
+        const generation=_voiceModeGeneration;
+        if(!_voiceModeRunIsCurrent(generation,sessionId)||_voiceModeState!=='listening') return;
+        setTimeout(()=>{
+          if(_voiceModeRunIsCurrent(generation,sessionId)&&_voiceModeState==='listening') _startListening();
+        },300);
+      },
+      onSessionChange:()=>{
+        if(_voiceModeActive) _deactivate();
+      },
+      onError:(error)=>{
+        if(!_voiceModeActive) return;
+        _deactivate();
+        const denied=error&&(error.name==='NotAllowedError'||error.name==='SecurityError');
+        showToast(t(denied?'mic_denied':'mic_network'));
+      },
+    });
+  }
+
+  _applyVoiceModePref();
 
   function _clearBrowserTtsRecovery(){
     if(_browserTtsKeepAlive){
@@ -1600,20 +1678,22 @@ window.renderTranscript=function(container, messages, opts){
   }
 
   function _armBrowserTtsRecovery(clean, rate){
+    const generation=_browserTtsGeneration;
+    const sessionId=_browserTtsSessionId;
     _clearBrowserTtsRecovery();
     _browserTtsSuppressNextErrorRearm=false;
     const safeRate=(Number.isFinite(rate)&&rate>0)?rate:1;
     // Chromium can drop utter.onend on later turns, so force a recovery path.
     const watchdogMs=Math.max(4000,Math.round((String(clean||'').length/(12*safeRate))*1000)+10000);
     _browserTtsWatchdog=setTimeout(()=>{
-      if(!_voiceModeActive||_voiceModeState!=='speaking') return;
+      if(!_voiceModeRunIsCurrent(generation,sessionId)||_voiceModeState!=='speaking') return;
       _browserTtsSuppressNextErrorRearm=true;
       try{ speechSynthesis.cancel(); }catch(_){}
       _clearBrowserTtsRecovery();
       _startListening();
     },watchdogMs);
     _browserTtsKeepAlive=setInterval(()=>{
-      if(!_voiceModeActive||_voiceModeState!=='speaking'){
+      if(!_voiceModeRunIsCurrent(generation,sessionId)||_voiceModeState!=='speaking'){
         _clearBrowserTtsRecovery();
         return;
       }
@@ -1644,6 +1724,18 @@ window.renderTranscript=function(container, messages, opts){
     }
     _clearBrowserTtsRecovery();
     _setState('listening');
+
+    const forceMedia=localStorage.getItem('mic_force_mediarecorder')==='1';
+    if((forceMedia||!SpeechRecognition)&&_mediaCapture&&_mediaCapture.supported()){
+      _recognition=null;
+      void _mediaCapture.start(_voiceModeSessionId());
+      return;
+    }
+    if(!SpeechRecognition){
+      _deactivate();
+      showToast(t('mic_network'));
+      return;
+    }
 
     _recognition=new SpeechRecognition();
     _recognition.continuous=localStorage.getItem('hermes-voice-continuous')==='true';
@@ -1725,6 +1817,7 @@ window.renderTranscript=function(container, messages, opts){
     // Pin the active session id so the TTS callback won't speak a different
     // session's reply if the user navigates away mid-stream.
     _voiceModeThinkingSid=(typeof S!=='undefined'&&S.session)?S.session.session_id:null;
+    if(_mediaCapture) _mediaCapture.cancel();
     try{ if(_recognition) _recognition.abort(); }catch(_){}
     _recognition=null;
     // send() is global from boot.js
@@ -1745,6 +1838,8 @@ window.renderTranscript=function(container, messages, opts){
     }
     _voiceModeThinkingSid=null;
     _setState('speaking');
+    const voiceGeneration=_voiceModeGeneration;
+    const speakingSid=currentSid;
 
     // Find last assistant message
     const rows=document.querySelectorAll('.msg-row[data-role="assistant"], .assistant-segment[data-raw-text]');
@@ -1781,32 +1876,24 @@ window.renderTranscript=function(container, messages, opts){
       };
       Promise.resolve(window._hermesTtsSynth(engine, clean, _opts))
         .then(function(buf){
+          if(!_voiceModeRunIsCurrent(voiceGeneration,speakingSid)) return;
           const blob=new Blob([buf]);
           const url=URL.createObjectURL(blob);
+          _voiceModeAudioUrl=url;
           const audio=new Audio(url);
           _playingEdgeAudio=audio;
           audio.onended=function(){
-            _ttsSpeaking=false;
-            if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
-            URL.revokeObjectURL(url);
-            if(_voiceModeActive) setTimeout(function(){_startListening();},500);
+            _voiceModeFinishAudio(audio,url,voiceGeneration,speakingSid,500);
           };
           audio.onerror=function(){
-            _ttsSpeaking=false;
-            if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
-            URL.revokeObjectURL(url);
-            if(_voiceModeActive) setTimeout(function(){_startListening();},1000);
+            _voiceModeFinishAudio(audio,url,voiceGeneration,speakingSid,1000);
           };
           audio.play().catch(function(){
-            _ttsSpeaking=false;
-            if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
-            URL.revokeObjectURL(url);
-            if(_voiceModeActive) setTimeout(function(){_startListening();},1000);
+            _voiceModeFinishAudio(audio,url,voiceGeneration,speakingSid,1000);
           });
         })
         .catch(function(){
-          _ttsSpeaking=false;
-          if(_voiceModeActive) setTimeout(function(){_startListening();},1000);
+          _voiceModeSynthesisFailed(voiceGeneration,speakingSid);
         });
       return;
     }
@@ -1822,31 +1909,23 @@ window.renderTranscript=function(container, messages, opts){
         return r.blob();
       })
       .then(blob => {
+        if(!_voiceModeRunIsCurrent(voiceGeneration,speakingSid)) return;
         const url = URL.createObjectURL(blob);
+        _voiceModeAudioUrl=url;
         const audio = new Audio(url);
         _playingEdgeAudio=audio;
         audio.onended = () => {
-          _ttsSpeaking=false;
-          if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
-          URL.revokeObjectURL(url);
-          if(_voiceModeActive) setTimeout(()=>_startListening(),500);
+          _voiceModeFinishAudio(audio,url,voiceGeneration,speakingSid,500);
         };
         audio.onerror = () => {
-          _ttsSpeaking=false;
-          if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
-          URL.revokeObjectURL(url);
-          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+          _voiceModeFinishAudio(audio,url,voiceGeneration,speakingSid,1000);
         };
         audio.play().catch(e => {
-          _ttsSpeaking=false;
-          if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
-          URL.revokeObjectURL(url);
-          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+          _voiceModeFinishAudio(audio,url,voiceGeneration,speakingSid,1000);
         });
       })
       .catch(() => {
-        _ttsSpeaking=false;
-        if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+        _voiceModeSynthesisFailed(voiceGeneration,speakingSid);
       });
       return;
     }
@@ -1862,31 +1941,23 @@ window.renderTranscript=function(container, messages, opts){
         return r.blob();
       })
       .then(blob => {
+        if(!_voiceModeRunIsCurrent(voiceGeneration,speakingSid)) return;
         const url = URL.createObjectURL(blob);
+        _voiceModeAudioUrl=url;
         const audio = new Audio(url);
         _playingEdgeAudio=audio;
         audio.onended = () => {
-          _ttsSpeaking=false;
-          if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
-          URL.revokeObjectURL(url);
-          if(_voiceModeActive) setTimeout(()=>_startListening(),500);
+          _voiceModeFinishAudio(audio,url,voiceGeneration,speakingSid,500);
         };
         audio.onerror = () => {
-          _ttsSpeaking=false;
-          if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
-          URL.revokeObjectURL(url);
-          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+          _voiceModeFinishAudio(audio,url,voiceGeneration,speakingSid,1000);
         };
         audio.play().catch(() => {
-          _ttsSpeaking=false;
-          if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
-          URL.revokeObjectURL(url);
-          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+          _voiceModeFinishAudio(audio,url,voiceGeneration,speakingSid,1000);
         });
       })
       .catch(() => {
-        _ttsSpeaking=false;
-        if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+        _voiceModeSynthesisFailed(voiceGeneration,speakingSid);
       });
       return;
     }
@@ -1908,7 +1979,9 @@ window.renderTranscript=function(container, messages, opts){
         return r.blob();
       })
       .then(blob => {
+        if(!_voiceModeRunIsCurrent(voiceGeneration,speakingSid)) return;
         const url = URL.createObjectURL(blob);
+        _voiceModeAudioUrl=url;
         const audio = new Audio(url);
         // Register with the shared handle (declared in ui.js, same global scope;
         // both scripts are fully evaluated before any voice interaction) so
@@ -1916,27 +1989,23 @@ window.renderTranscript=function(container, messages, opts){
         // Edge playback. Without this the audio is local here and unstoppable.
         _playingEdgeAudio=audio;
         audio.onended = () => {
-          _ttsSpeaking=false;
-          if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
-          URL.revokeObjectURL(url);
-          if(_voiceModeActive) setTimeout(()=>_startListening(),500);
+          _voiceModeFinishAudio(audio,url,voiceGeneration,speakingSid,500);
         };
         audio.onerror = () => {
-          _ttsSpeaking=false;
-          if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
-          URL.revokeObjectURL(url);
-          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+          _voiceModeFinishAudio(audio,url,voiceGeneration,speakingSid,1000);
         };
         audio.play().catch(e => {
-          _ttsSpeaking=false;
-          if(_playingEdgeAudio===audio) _playingEdgeAudio=null;
-          if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+          _voiceModeFinishAudio(audio,url,voiceGeneration,speakingSid,1000);
         });
       })
       .catch(() => {
-        _ttsSpeaking=false;
-        if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+        _voiceModeSynthesisFailed(voiceGeneration,speakingSid);
       });
+      return;
+    }
+    if(!window.speechSynthesis||!window.SpeechSynthesisUtterance){
+      _deactivate();
+      showToast(t('tts_not_supported'));
       return;
     }
     const utter=new SpeechSynthesisUtterance(clean);
@@ -1954,26 +2023,31 @@ window.renderTranscript=function(container, messages, opts){
     if(!isNaN(savedPitch)) utter.pitch=Math.min(2,Math.max(0,savedPitch));
 
     utter.onend=()=>{
+      if(!_voiceModeRunIsCurrent(voiceGeneration,speakingSid)) return;
       _browserTtsSuppressNextErrorRearm=false;
       _clearBrowserTtsRecovery();
-      // After speaking, go back to listening
-      if(_voiceModeActive&&_voiceModeState==='speaking') setTimeout(()=>_startListening(),500);
+      if(_voiceModeActive&&_voiceModeState==='speaking'){
+        _voiceModeResumeAfterPlayback(voiceGeneration,speakingSid,500);
+      }
     };
     utter.onerror=()=>{
+      if(!_voiceModeRunIsCurrent(voiceGeneration,speakingSid)) return;
       _clearBrowserTtsRecovery();
       if(_browserTtsSuppressNextErrorRearm){
         _browserTtsSuppressNextErrorRearm=false;
         return;
       }
-      if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+      _voiceModeResumeAfterPlayback(voiceGeneration,speakingSid,1000);
     };
 
+    _browserTtsGeneration=voiceGeneration;
+    _browserTtsSessionId=speakingSid;
     _armBrowserTtsRecovery(clean, utter.rate);
     try{
       speechSynthesis.speak(utter);
     }catch(_){
       _clearBrowserTtsRecovery();
-      if(_voiceModeActive) setTimeout(()=>_startListening(),1000);
+      _voiceModeResumeAfterPlayback(voiceGeneration,speakingSid,1000);
     }
   }
 
@@ -2017,7 +2091,13 @@ window.renderTranscript=function(container, messages, opts){
       showToast(t('mic_insecure_origin'));
       return;
     }
+    if(!_voiceModeCanListen()||!_voiceModeCanSpeak()){
+      _applyVoiceModePref();
+      showToast(t(!_voiceModeCanListen()?'mic_network':'tts_not_supported'));
+      return;
+    }
     _voiceModeActive=true;
+    _voiceModeGeneration++;
     modeBtn.classList.add('active');
     _setButtonTooltip(modeBtn, t('voice_mode_toggle_active'));
     showToast(t('voice_mode_active'),1500);
@@ -2033,6 +2113,7 @@ window.renderTranscript=function(container, messages, opts){
 
   function _deactivate(){
     _voiceModeActive=false;
+    _voiceModeGeneration++;
     _voiceModeState='idle';
     _voiceModeThinkingSid=null;
     _browserTtsSuppressNextErrorRearm=false;
@@ -2043,9 +2124,12 @@ window.renderTranscript=function(container, messages, opts){
     _clearBrowserTtsRecovery();
     try{ if(_recognition) _recognition.abort(); }catch(_){}
     _recognition=null;
+    if(_mediaCapture) _mediaCapture.cancel();
     if(typeof stopTTS==='function') stopTTS();
-    // Restore original autoReadLastAssistant
-    if(_origAutoRead) window.autoReadLastAssistant=_origAutoRead;
+    if(_voiceModeAudioUrl){
+      URL.revokeObjectURL(_voiceModeAudioUrl);
+      _voiceModeAudioUrl=null;
+    }
     // Clear textarea if it was only voice input
     ta.value='';
     autoResize();

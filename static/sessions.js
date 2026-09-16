@@ -1397,6 +1397,10 @@ async function newSession(flash, options={}){
     if(typeof showToast==='function') showToast(_newSessionPendingText(),1500);
     return _newSessionInFlight;
   }
+  if(S.session&&typeof window._voiceModeActive==='function'&&window._voiceModeActive()
+      &&typeof window._voiceModeDeactivate==='function'){
+    window._voiceModeDeactivate();
+  }
   _setNewSessionPending(true);
   _newSessionInFlight=(async()=>{
     // Starting a brand-new chat must not carry named context blocks selected in
@@ -1735,6 +1739,10 @@ async function loadSession(sid){
       );
     }
     return;
+  }
+  if(currentSid!==sid&&typeof window._voiceModeActive==='function'&&window._voiceModeActive()
+      &&typeof window._voiceModeDeactivate==='function'){
+    window._voiceModeDeactivate();
   }
   // Mark this session as the in-flight load. Subsequent loadSession() calls
   // will overwrite this; stale awaits use the mismatch to bail out (#1060).
