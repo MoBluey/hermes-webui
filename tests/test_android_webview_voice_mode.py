@@ -16,6 +16,7 @@ from tests._pytest_port import BASE
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE = ROOT / "static" / "voice_mode_media.js"
+SENTENCES = ROOT / "static" / "voice_mode_sentences.js"
 
 
 def _run_node(body: str) -> None:
@@ -103,6 +104,64 @@ def test_media_capture_transcribes_after_speech_and_silence() -> None:
           assert.strictEqual(stoppedTracks, 1);
           assert.strictEqual(contextClosed, 1);
         }})().catch(error => {{ console.error(error); process.exitCode = 1; }});
+        """
+    )
+
+
+def test_sentence_tracker_streams_ordered_prose_exactly_once_and_flushes_tail() -> None:
+    _run_node(
+        f"""
+        const assert = require('assert');
+        const create = require({str(SENTENCES)!r});
+        const tracker = create();
+        assert.deepStrictEqual(tracker.update('First sentence', false), []);
+        assert.deepStrictEqual(tracker.update('First sentence. Second', false), ['First sentence.']);
+        assert.deepStrictEqual(tracker.update('First sentence. Second sentence!', false), ['Second sentence!']);
+        assert.deepStrictEqual(tracker.update('First sentence. Second sentence!', false), []);
+        assert.deepStrictEqual(tracker.update('First sentence. Second sentence! Final tail', true), ['Final tail']);
+        """
+    )
+
+
+def test_sentence_tracker_rebases_cumulative_revisions_without_fragments() -> None:
+    _run_node(
+        f"""
+        const assert = require('assert');
+        const tracker = require({str(SENTENCES)!r})();
+        assert.deepStrictEqual(tracker.update('Alpha sentence. Draft', false), ['Alpha sentence.']);
+        assert.deepStrictEqual(
+          tracker.update('Revised alpha sentence. Final sentence.', false),
+          ['Final sentence.'],
+        );
+        const punctuation = require({str(SENTENCES)!r})();
+        assert.deepStrictEqual(punctuation.update('Hello world.', false), ['Hello world.']);
+        assert.deepStrictEqual(punctuation.update('Hello world! Next.', false), ['Next.']);
+        """
+    )
+
+
+def test_sentence_tracker_excludes_split_code_fences() -> None:
+    _run_node(
+        f"""
+        const assert = require('assert');
+        const tracker = require({str(SENTENCES)!r})();
+        assert.deepStrictEqual(tracker.update('Visible. ``', false), ['Visible.']);
+        assert.deepStrictEqual(tracker.update('Visible. ```js\\nconsole.log(', false), []);
+        assert.deepStrictEqual(tracker.update('Visible. ```js\\nconsole.log("secret");\\n``` Safe tail.', false), ['Safe tail.']);
+        assert.deepStrictEqual(tracker.update('Visible. ```js\\nsecret.\\n``` Safe tail. ~~~py\\nhidden.\\n~~~ Final.', false), ['Final.']);
+        const mixed = require({str(SENTENCES)!r})();
+        assert.deepStrictEqual(mixed.update('Before. ```js\\nsecret. ~~~ more secret. ``` Safe.', false), ['Before.', 'Safe.']);
+        """
+    )
+
+
+def test_sentence_tracker_waits_for_split_inline_code_and_ignores_list_marker() -> None:
+    _run_node(
+        f"""
+        const assert = require('assert');
+        const tracker = require({str(SENTENCES)!r})();
+        assert.deepStrictEqual(tracker.update('Intro. `secret. still secret', false), ['Intro.']);
+        assert.deepStrictEqual(tracker.update('Intro. `secret. still secret` 1. First item.', false), ['First item.']);
         """
     )
 
@@ -227,6 +286,7 @@ def test_boot_loads_media_fallback_before_hands_free_controller() -> None:
     html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
     boot = (ROOT / "static" / "boot.js").read_text(encoding="utf-8")
     assert html.index("static/voice_mode_media.js") < html.index("static/boot.js")
+    assert html.index("static/voice_mode_sentences.js") < html.index("static/boot.js")
     assert "window.createHermesVoiceModeMediaCapture" in boot
     assert "if(!hasSTT||!hasTTS) return;" not in boot
     assert "mic_force_mediarecorder" in boot
@@ -234,11 +294,25 @@ def test_boot_loads_media_fallback_before_hands_free_controller() -> None:
     assert "_voiceModeRunIsCurrent(voiceGeneration,speakingSid)" in boot
 
 
+def test_stream_hook_receives_only_parsed_visible_assistant_prose() -> None:
+    source = (ROOT / "static" / "messages.js").read_text(encoding="utf-8")
+    expected = "window._voiceModeOnStreamText(String((voiceParsed&&voiceParsed.displayText)||''),activeSid,streamId)"
+    assert source.count(expected) == 2
+    assert "window._voiceModeOnStreamText(d.text" not in source
+    for name in ("_finalizeStreamEndFallback", "_restoreSettledSession", "_handleStreamError"):
+        body = source[source.index(f"function {name}") :]
+        assert "window._voiceModeOnStreamCancel(activeSid,streamId)" in body[:2500]
+
+
 def test_media_fallback_asset_is_served(cleanup_test_sessions) -> None:
     with urllib.request.urlopen(BASE + "/static/voice_mode_media.js", timeout=10) as response:
         source = response.read().decode("utf-8")
     assert response.status == 200
     assert "createHermesVoiceModeMediaCapture" in source
+    with urllib.request.urlopen(BASE + "/static/voice_mode_sentences.js", timeout=10) as response:
+        source = response.read().decode("utf-8")
+    assert response.status == 200
+    assert "createHermesVoiceSentenceTracker" in source
 
 
 def test_session_and_profile_navigation_end_voice_mode() -> None:
@@ -298,6 +372,8 @@ def test_webview_voice_controller_transcribes_speaks_and_relistens() -> None:
         global._setButtonTooltip = () => {{}};
         global._micOriginNeedsSecureContext = () => false;
         global.autoResize = () => {{}};
+        let originalAutoReadCount = 0;
+        global.autoReadLastAssistant = () => originalAutoReadCount++;
         let stopTtsCount = 0;
         global.stopTTS = () => {{
           stopTtsCount++;
@@ -333,10 +409,13 @@ def test_webview_voice_controller_transcribes_speaks_and_relistens() -> None:
             cancel: () => cancelCount++,
           }};
         }};
+        window.createHermesVoiceSentenceTracker = require({str(SENTENCES)!r});
         let requestedUrl = null;
+        const requestedTexts = [];
         global.fetch = async (url, options) => {{
           requestedUrl = url;
           assert.strictEqual(options.method, 'POST');
+          requestedTexts.push(JSON.parse(options.body).text);
           return {{ok: true, arrayBuffer: async () => new ArrayBuffer(8)}};
         }};
         let inGesture = false;
@@ -384,23 +463,61 @@ def test_webview_voice_controller_transcribes_speaks_and_relistens() -> None:
           assert.strictEqual(element('msg').value, 'hello Hermes');
           assert.strictEqual(sendCount, 1);
           assert.ok(cancelCount >= 1);
-          window.autoReadLastAssistant();
+          window._voiceModeOnStreamText('First sentence.', 'session-a', 'stream-a');
           await new Promise(resolve => setImmediate(resolve));
           await new Promise(resolve => setImmediate(resolve));
           assert.strictEqual(requestedUrl, 'https://hermes.test/api/tts');
+          assert.deepStrictEqual(requestedTexts, ['First sentence.']);
           assert.strictEqual(source.played, true);
           assert.strictEqual(listenCount, 1);
           source.onended();
+          await new Promise(resolve => setImmediate(resolve));
+          window._voiceModeOnStreamText('First sentence. Second sentence!', 'session-a', 'stream-a');
+          await new Promise(resolve => setImmediate(resolve));
+          await new Promise(resolve => setImmediate(resolve));
+          assert.deepStrictEqual(requestedTexts, ['First sentence.', 'Second sentence!']);
+          window._voiceModeOnStreamDone('session-a', 'stream-a');
+          source.onended();
+          await new Promise(resolve => setImmediate(resolve));
+          pendingEmptyTimers.shift()();
           assert.strictEqual(listenCount, 2);
+          window.autoReadLastAssistant();
+          assert.deepStrictEqual(requestedTexts, ['First sentence.', 'Second sentence!']);
+          assert.strictEqual(originalAutoReadCount, 0);
+          captureOptions.onTranscript('code only', 'session-a');
+          assert.strictEqual(sendCount, 2);
+          window._voiceModeOnStreamText('```js\\nsecret.\\n```', 'session-a', 'stream-code');
+          window._voiceModeOnStreamDone('session-a', 'stream-code');
+          pendingEmptyTimers.shift()();
+          assert.strictEqual(listenCount, 3);
+          window.autoReadLastAssistant();
+          assert.deepStrictEqual(requestedTexts, ['First sentence.', 'Second sentence!']);
+          assert.strictEqual(originalAutoReadCount, 0);
+          const registeredTexts = [];
+          settings.set('hermes-tts-engine', 'registered-test');
+          window._hermesTtsIsRegistered = engine => engine === 'registered-test';
+          window._hermesTtsSynth = async (engine, text) => {{ registeredTexts.push([engine, text]); return new ArrayBuffer(8); }};
+          captureOptions.onTranscript('registered engine', 'session-a');
+          assert.strictEqual(sendCount, 3);
+          window._voiceModeOnStreamText('Registered sentence.', 'session-a', 'stream-registered');
+          await new Promise(resolve => setImmediate(resolve));
+          await new Promise(resolve => setImmediate(resolve));
+          assert.deepStrictEqual(registeredTexts, [['registered-test', 'Registered sentence.']]);
+          window._voiceModeOnStreamDone('session-a', 'stream-registered');
+          source.onended();
+          await new Promise(resolve => setImmediate(resolve));
+          pendingEmptyTimers.shift()();
+          assert.strictEqual(listenCount, 4);
+          settings.set('hermes-tts-engine', 'openai');
           captureOptions.onEmpty('session-a');
           assert.strictEqual(pendingEmptyTimers.length, 1);
           clickVoice(button);
           clickVoice(button);
-          assert.strictEqual(listenCount, 3);
+          assert.strictEqual(listenCount, 5);
           pendingEmptyTimers.shift()();
-          assert.strictEqual(listenCount, 3);
+          assert.strictEqual(listenCount, 5);
           captureOptions.onTranscript('second turn', 'session-a');
-          assert.strictEqual(sendCount, 2);
+          assert.strictEqual(sendCount, 4);
           window.autoReadLastAssistant();
           await new Promise(resolve => setImmediate(resolve));
           await new Promise(resolve => setImmediate(resolve));
@@ -408,36 +525,36 @@ def test_webview_voice_controller_transcribes_speaks_and_relistens() -> None:
           const staleEnded = staleAudio.onended;
           clickVoice(button);
           clickVoice(button);
-          assert.strictEqual(listenCount, 4);
+          assert.strictEqual(listenCount, 6);
           assert.strictEqual(staleAudio.stopped, true);
           assert.strictEqual(staleAudio.disconnected, true);
           staleEnded();
-          assert.strictEqual(listenCount, 4);
+          assert.strictEqual(listenCount, 6);
           clickVoice(button);
           audioContext.state = 'suspended';
           failResume = true;
           clickVoice(button);
-          assert.strictEqual(listenCount, 5);
+          assert.strictEqual(listenCount, 7);
           captureOptions.onTranscript('playback failure', 'session-a');
-          assert.strictEqual(sendCount, 3);
+          assert.strictEqual(sendCount, 5);
           window.autoReadLastAssistant();
           await new Promise(resolve => setImmediate(resolve));
           await new Promise(resolve => setImmediate(resolve));
           assert.ok(toasts.some(message => message.includes('OpenAI TTS error: playback denied')));
-          assert.strictEqual(listenCount, 6);
+          assert.strictEqual(listenCount, 8);
           clickVoice(button);
           captureOptions.onTranscript('ghost turn', 'session-a');
-          assert.strictEqual(sendCount, 3);
+          assert.strictEqual(sendCount, 5);
           failResume = false;
           audioContext.state = 'running';
           clickVoice(button);
-          assert.strictEqual(listenCount, 7);
+          assert.strictEqual(listenCount, 9);
           S.session.session_id = 'session-b';
           captureOptions.onSessionChange('session-a');
           captureOptions.onTranscript('wrong session', 'session-a');
-          assert.strictEqual(sendCount, 3);
+          assert.strictEqual(sendCount, 5);
           assert.strictEqual(window._voiceModeActive(), false);
-          assert.deepStrictEqual(listenedSessions, ['session-a', 'session-a', 'session-a', 'session-a', 'session-a', 'session-a', 'session-a']);
+          assert.deepStrictEqual(listenedSessions, ['session-a', 'session-a', 'session-a', 'session-a', 'session-a', 'session-a', 'session-a', 'session-a', 'session-a']);
         }})().catch(error => {{ console.error(error); process.exitCode = 1; }});
         """
     )

@@ -1589,6 +1589,15 @@ window.renderTranscript=function(container, messages, opts){
   let _voiceModeAudioContext=null;
   let _voiceModeAudioUnlock=null;
   let _voiceModeAudioSource=null;
+  let _voiceModeStreamTracker=null;
+  let _voiceModeStreamId=null;
+  let _voiceModeStreamSid=null;
+  let _voiceModeStreamText='';
+  let _voiceModeSentenceQueue=[];
+  let _voiceModeSentenceRunning=false;
+  let _voiceModeStreamDone=false;
+  let _voiceModeStreamSpoke=false;
+  let _voiceModeTtsAbort=null;
   let _browserTtsKeepAlive=null;
   let _browserTtsWatchdog=null;
   let _browserTtsSuppressNextErrorRearm=false;
@@ -1626,7 +1635,7 @@ window.renderTranscript=function(container, messages, opts){
       _ttsSpeaking=false;
     }
     try{ source.disconnect(); }catch(_){}
-    if(ownsPlayback&&ownsRun) _voiceModeResumeAfterPlayback(generation,sessionId,delay);
+    if(ownsPlayback&&ownsRun&&delay!==null) _voiceModeResumeAfterPlayback(generation,sessionId,delay);
   }
 
   function _voiceModeSynthesisFailed(generation,sessionId,error,label){
@@ -1652,7 +1661,7 @@ window.renderTranscript=function(container, messages, opts){
     }
   }
 
-  function _playVoiceModeAudioBuffer(arrayBuffer,generation,sessionId,label){
+  function _playVoiceModeAudioBuffer(arrayBuffer,generation,sessionId,label,resumeAfter=true){
     return Promise.resolve(_voiceModeAudioUnlock).then(unlockError=>{
       if(unlockError) throw unlockError;
       if(!_voiceModeRunIsCurrent(generation,sessionId)) return;
@@ -1667,7 +1676,7 @@ window.renderTranscript=function(container, messages, opts){
           _voiceModeAudioSource=source;
           _playingEdgeAudio=source;
           source.onended=()=>{
-            _voiceModeFinishAudio(source,generation,sessionId,500);
+            _voiceModeFinishAudio(source,generation,sessionId,resumeAfter?500:null);
             resolve();
           };
           try{ source.start(0); }
@@ -1682,7 +1691,11 @@ window.renderTranscript=function(container, messages, opts){
         },reject);
       });
     }).catch(error=>{
-      _voiceModeSynthesisFailed(generation,sessionId,error,label);
+      if(resumeAfter) _voiceModeSynthesisFailed(generation,sessionId,error,label);
+      else if(_voiceModeRunIsCurrent(generation,sessionId)){
+        const message=(error&&error.message)||String(error||'Playback failed');
+        showToast((label||'TTS')+' error: '+message,4000,'error');
+      }
     });
   }
 
@@ -1876,12 +1889,134 @@ window.renderTranscript=function(container, messages, opts){
     // Pin the active session id so the TTS callback won't speak a different
     // session's reply if the user navigates away mid-stream.
     _voiceModeThinkingSid=(typeof S!=='undefined'&&S.session)?S.session.session_id:null;
+    _resetVoiceModeStream();
     if(_mediaCapture) _mediaCapture.cancel();
     try{ if(_recognition) _recognition.abort(); }catch(_){}
     _recognition=null;
     // send() is global from boot.js
     if(typeof send==='function') send();
   }
+
+  function _resetVoiceModeStream(){
+    if(_voiceModeTtsAbort){
+      try{ _voiceModeTtsAbort.abort(); }catch(_){}
+      _voiceModeTtsAbort=null;
+    }
+    _voiceModeStreamTracker=null;
+    _voiceModeStreamId=null;
+    _voiceModeStreamSid=null;
+    _voiceModeStreamText='';
+    _voiceModeSentenceQueue=[];
+    _voiceModeSentenceRunning=false;
+    _voiceModeStreamDone=false;
+    _voiceModeStreamSpoke=false;
+  }
+
+  function _voiceModeStreamOwns(sessionId,streamId){
+    if(!_voiceModeActive||(_voiceModeState!=='thinking'&&_voiceModeState!=='speaking')) return false;
+    if(_voiceModeThinkingSid&&sessionId!==_voiceModeThinkingSid) return false;
+    if(_voiceModeStreamSid&&sessionId!==_voiceModeStreamSid) return false;
+    if(_voiceModeStreamId&&streamId!==_voiceModeStreamId) return false;
+    if(!_voiceModeStreamSid){
+      _voiceModeStreamSid=sessionId;
+      _voiceModeThinkingSid=sessionId;
+    }
+    if(!_voiceModeStreamId) _voiceModeStreamId=streamId;
+    return true;
+  }
+
+  function _voiceModeTtsOptions(){
+    return {
+      voice:localStorage.getItem('hermes-tts-voice')||'',
+      rate:parseFloat(localStorage.getItem('hermes-tts-rate')),
+      pitch:parseFloat(localStorage.getItem('hermes-tts-pitch')),
+    };
+  }
+
+  function _synthVoiceModeSentence(text,generation,sessionId){
+    const engine=localStorage.getItem('hermes-tts-engine')||'browser';
+    const opts=_voiceModeTtsOptions();
+    if(typeof window._hermesTtsIsRegistered==='function'&&window._hermesTtsIsRegistered(engine)){
+      return Promise.resolve(window._hermesTtsSynth(engine,text,opts))
+        .then(buf=>_playVoiceModeAudioBuffer(buf,generation,sessionId,'TTS',false))
+        .catch(error=>{
+          if(_voiceModeRunIsCurrent(generation,sessionId)) showToast('TTS error: '+((error&&error.message)||error),4000,'error');
+        });
+    }
+    const body={text:text,engine:engine};
+    if(engine==='edge'){
+      body.voice=opts.voice||'zh-CN-XiaoxiaoNeural';
+      if(!isNaN(opts.rate)){ const pct=Math.round((opts.rate-1)*100); body.rate=(pct>=0?'+':'')+pct+'%'; }
+      if(!isNaN(opts.pitch)){ const hz=Math.round((opts.pitch-1)*50); body.pitch=(hz>=0?'+':'')+hz+'Hz'; }
+      delete body.engine;
+    }
+    const controller=new AbortController();
+    _voiceModeTtsAbort=controller;
+    const label=engine==='openai'?'OpenAI TTS':engine==='elevenlabs'?'ElevenLabs TTS':'Edge TTS';
+    return fetch(new URL('api/tts',document.baseURI||location.href).href,{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:controller.signal,
+    }).then(response=>{
+      if(!response.ok) throw new Error('TTS request failed: '+response.status);
+      return response.arrayBuffer();
+    }).then(buf=>_playVoiceModeAudioBuffer(buf,generation,sessionId,label,false))
+      .catch(error=>{
+        if(error&&error.name==='AbortError') return;
+        if(_voiceModeRunIsCurrent(generation,sessionId)) showToast(label+' error: '+((error&&error.message)||error),4000,'error');
+      }).finally(()=>{ if(_voiceModeTtsAbort===controller) _voiceModeTtsAbort=null; });
+  }
+
+  function _drainVoiceModeSentences(){
+    if(_voiceModeSentenceRunning||!_voiceModeActive) return;
+    const sessionId=_voiceModeStreamSid;
+    const generation=_voiceModeGeneration;
+    const sentence=_voiceModeSentenceQueue.shift();
+    if(!sentence){
+      if(_voiceModeStreamDone&&_voiceModeRunIsCurrent(generation,sessionId)){
+        _voiceModeThinkingSid=null;
+        _voiceModeStreamDone=false;
+        if(_voiceModeState!=='speaking') _setState('speaking');
+        _voiceModeResumeAfterPlayback(generation,sessionId,300);
+      }
+      return;
+    }
+    _voiceModeSentenceRunning=true;
+    _voiceModeStreamSpoke=true;
+    _setState('speaking');
+    Promise.resolve(_synthVoiceModeSentence(sentence,generation,sessionId)).then(()=>{
+      if(!_voiceModeRunIsCurrent(generation,sessionId)) return;
+      _voiceModeSentenceRunning=false;
+      _drainVoiceModeSentences();
+    },()=>{
+      if(!_voiceModeRunIsCurrent(generation,sessionId)) return;
+      _voiceModeSentenceRunning=false;
+      _drainVoiceModeSentences();
+    });
+  }
+
+  window._voiceModeOnStreamText=function(text,sessionId,streamId){
+    if((localStorage.getItem('hermes-tts-engine')||'browser')==='browser') return;
+    if(!_voiceModeStreamOwns(sessionId,streamId)) return;
+    if(!_voiceModeStreamTracker){
+      if(typeof window.createHermesVoiceSentenceTracker!=='function') return;
+      _voiceModeStreamTracker=window.createHermesVoiceSentenceTracker();
+    }
+    _voiceModeStreamText=String(text||'');
+    _voiceModeSentenceQueue.push(..._voiceModeStreamTracker.update(_voiceModeStreamText,false));
+    _drainVoiceModeSentences();
+  };
+
+  window._voiceModeOnStreamDone=function(sessionId,streamId){
+    if((localStorage.getItem('hermes-tts-engine')||'browser')==='browser') return;
+    if(!_voiceModeStreamOwns(sessionId,streamId)) return;
+    if(!_voiceModeStreamTracker) return;
+    _voiceModeSentenceQueue.push(..._voiceModeStreamTracker.update(_voiceModeStreamText,true));
+    _voiceModeStreamDone=true;
+    _drainVoiceModeSentences();
+  };
+
+  window._voiceModeOnStreamCancel=function(sessionId,streamId){
+    if(_voiceModeStreamOwns(sessionId,streamId)) _deactivate();
+  };
 
   function _speakResponse(){
     if(!_voiceModeActive) return;
@@ -2081,6 +2216,10 @@ window.renderTranscript=function(container, messages, opts){
   // own speak-and-resume flow instead of the default auto-read.
   const _origAutoRead=(typeof autoReadLastAssistant==='function')?autoReadLastAssistant:null;
   window.autoReadLastAssistant=function(){
+    if(_voiceModeActive&&_voiceModeStreamTracker){
+      _drainVoiceModeSentences();
+      return;
+    }
     if(_voiceModeActive&&_voiceModeState==='thinking'){
       _speakResponse();
       return;
@@ -2123,6 +2262,7 @@ window.renderTranscript=function(container, messages, opts){
     _voiceModeGeneration++;
     _voiceModeState='idle';
     _voiceModeThinkingSid=null;
+    _resetVoiceModeStream();
     _browserTtsSuppressNextErrorRearm=false;
     modeBtn.classList.remove('active');
     _setButtonTooltip(modeBtn, t('voice_mode_toggle'));

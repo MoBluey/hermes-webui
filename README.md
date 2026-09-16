@@ -248,7 +248,8 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Live interim transcription appears in the textarea
 - Auto-stops after ~2s of silence
 - Appends to existing textarea content (doesn't replace)
-- Optional hands-free mode listens, submits after silence, reads the reply with the selected browser or server TTS engine, then listens again
+- Optional hands-free mode listens and submits after silence; server TTS speaks completed prose sentences as the reply streams, while browser TTS reads the completed reply using its recovery watchdog
+- Hands-free mode listens again only after the reply and speech queue finish
 - Changing chats while server transcription is pending ends hands-free mode and discards the old chat's result
 - Voice controls require microphone permission and either HTTPS or a loopback origin; unsupported controls stay hidden
 

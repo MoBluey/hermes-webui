@@ -2445,6 +2445,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _streamEndRecoveryTimer=setTimeout(()=>{void _runStreamEndRecovery(source);},delay);
   }
   function _finalizeStreamEndFallback(source){
+    if(typeof window._voiceModeOnStreamCancel==='function') window._voiceModeOnStreamCancel(activeSid,streamId);
     _clearStreamEndRecovery();
     if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
     _cancelThrottledSnapshotTimer();
@@ -5736,6 +5737,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       assistantText+=d.text;
       syncInflightAssistantMessage();
       if(!S.session||S.session.session_id!==activeSid) return;
+      if(typeof window._voiceModeOnStreamText==='function'){
+        const voiceParsed=_parseStreamState();
+        window._voiceModeOnStreamText(String((voiceParsed&&voiceParsed.displayText)||''),activeSid,streamId);
+      }
       _completeAutomaticCompressionOnLiveProgress(activeSid);
       if(_freshSegment) appendThinking('', _liveThinkingPlacement());
       // Once the assistant row exists its creation gate is already satisfied, and
@@ -5790,6 +5795,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         recordActivityBoundary();
         _resetAssistantSegment();
         return;
+      }
+      if(typeof window._voiceModeOnStreamText==='function'){
+        const voiceParsed=_parseStreamState();
+        window._voiceModeOnStreamText(String((voiceParsed&&voiceParsed.displayText)||''),activeSid,streamId);
       }
       _completeAutomaticCompressionOnLiveProgress(activeSid);
       ensureAssistantRow(true);
@@ -6382,6 +6391,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
           if(typeof noteWorkspaceMutationsFromToolCalls==='function') noteWorkspaceMutationsFromToolCalls(S.toolCalls);
           loadDir('.', { preservePreview: true });
+          if(completedSid!==activeSid&&typeof window._voiceModeOnStreamCancel==='function'){
+            window._voiceModeOnStreamCancel(activeSid,_settledStreamId);
+          }else if(typeof window._voiceModeOnStreamDone==='function'){
+            window._voiceModeOnStreamDone(activeSid,_settledStreamId);
+          }
           // TTS auto-read: speak the last assistant response if enabled (#499)
           if(typeof autoReadLastAssistant==='function') setTimeout(()=>autoReadLastAssistant(), 300);
         }
@@ -6571,6 +6585,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('apperror',e=>{
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+      if(typeof window._voiceModeOnStreamCancel==='function') window._voiceModeOnStreamCancel(activeSid,streamId);
       _clearStreamEndRecovery();
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
@@ -6833,6 +6848,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('cancel',e=>{
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+      if(typeof window._voiceModeOnStreamCancel==='function') window._voiceModeOnStreamCancel(activeSid,streamId);
       _clearStreamEndRecovery();
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
@@ -7000,6 +7016,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const session=data&&data.session;
       if(!session) return returnStatus?'missing':false;
       if(session.active_stream_id||session.pending_user_message) return returnStatus?'active':false;
+      if(typeof window._voiceModeOnStreamCancel==='function') window._voiceModeOnStreamCancel(activeSid,streamId);
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
       _cancelThrottledSnapshotTimer();
       _clearAnchorProseIncrementalNode();
@@ -7096,6 +7113,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _closeSource(source);
       return;
     }
+    if(typeof window._voiceModeOnStreamCancel==='function') window._voiceModeOnStreamCancel(activeSid,streamId);
     _clearStreamEndRecovery();
     // Opus review Q1: mirror done/apperror/cancel finalization so any pending rAF
     // cannot fire after renderMessages() has settled the DOM with the error message.
