@@ -293,7 +293,8 @@ def test_webview_voice_controller_transcribes_speaks_and_relistens() -> None:
         ]);
         global.localStorage = {{getItem: key => settings.get(key) ?? null}};
         global.t = key => key;
-        global.showToast = () => {{}};
+        const toasts = [];
+        global.showToast = message => toasts.push(message);
         global._setButtonTooltip = () => {{}};
         global._micOriginNeedsSecureContext = () => false;
         global.autoResize = () => {{}};
@@ -301,7 +302,8 @@ def test_webview_voice_controller_transcribes_speaks_and_relistens() -> None:
         global.stopTTS = () => {{
           stopTtsCount++;
           if(global._playingEdgeAudio) {{
-            global._playingEdgeAudio.pause();
+            global._playingEdgeAudio.stop();
+            global._playingEdgeAudio.disconnect();
             global._playingEdgeAudio = null;
           }}
         }};
@@ -335,24 +337,48 @@ def test_webview_voice_controller_transcribes_speaks_and_relistens() -> None:
         global.fetch = async (url, options) => {{
           requestedUrl = url;
           assert.strictEqual(options.method, 'POST');
-          return {{ok: true, blob: async () => new Blob(['audio'])}};
+          return {{ok: true, arrayBuffer: async () => new ArrayBuffer(8)}};
         }};
-        let audioUrlCount = 0;
-        const revokedUrls = [];
-        global.URL.createObjectURL = () => 'blob:voice-' + (++audioUrlCount);
-        global.URL.revokeObjectURL = url => revokedUrls.push(url);
-        let audio = null;
-        global.Audio = class {{
-          constructor() {{ audio = this; }}
-          play() {{ this.played = true; return Promise.resolve(); }}
-          pause() {{ this.paused = true; }}
+        let inGesture = false;
+        let resumeCount = 0;
+        let source = null;
+        let failResume = false;
+        const audioContext = {{
+          state: 'suspended',
+          destination: {{}},
+          resume() {{
+            assert.strictEqual(inGesture, true, 'AudioContext must be resumed by the voice-button gesture');
+            resumeCount++;
+            if(failResume) return Promise.reject(new Error('playback denied'));
+            this.state = 'running';
+            return Promise.resolve();
+          }},
+          decodeAudioData(_buffer, success, failure) {{
+            success({{decoded: true}});
+          }},
+          createBufferSource() {{
+            source = {{
+              connect() {{}},
+              disconnect() {{ this.disconnected = true; }},
+              start() {{ this.played = true; }},
+              stop() {{ this.stopped = true; }},
+            }};
+            return source;
+          }},
+        }};
+        global._getTtsAudioCtx = () => audioContext;
+        const clickVoice = button => {{
+          inGesture = true;
+          button.onclick();
+          inGesture = false;
         }};
 
         eval(controller);
         (async () => {{
           const button = element('btnVoiceMode');
           assert.strictEqual(button.style.display, '');
-          button.onclick();
+          clickVoice(button);
+          assert.strictEqual(resumeCount, 1);
           assert.strictEqual(listenCount, 1);
           captureOptions.onTranscript('hello Hermes', 'session-a');
           assert.strictEqual(element('msg').value, 'hello Hermes');
@@ -362,14 +388,14 @@ def test_webview_voice_controller_transcribes_speaks_and_relistens() -> None:
           await new Promise(resolve => setImmediate(resolve));
           await new Promise(resolve => setImmediate(resolve));
           assert.strictEqual(requestedUrl, 'https://hermes.test/api/tts');
-          assert.strictEqual(audio.played, true);
+          assert.strictEqual(source.played, true);
           assert.strictEqual(listenCount, 1);
-          audio.onended();
+          source.onended();
           assert.strictEqual(listenCount, 2);
           captureOptions.onEmpty('session-a');
           assert.strictEqual(pendingEmptyTimers.length, 1);
-          button.onclick();
-          button.onclick();
+          clickVoice(button);
+          clickVoice(button);
           assert.strictEqual(listenCount, 3);
           pendingEmptyTimers.shift()();
           assert.strictEqual(listenCount, 3);
@@ -378,26 +404,40 @@ def test_webview_voice_controller_transcribes_speaks_and_relistens() -> None:
           window.autoReadLastAssistant();
           await new Promise(resolve => setImmediate(resolve));
           await new Promise(resolve => setImmediate(resolve));
-          const staleAudio = audio;
-          button.onclick();
-          button.onclick();
+          const staleAudio = source;
+          const staleEnded = staleAudio.onended;
+          clickVoice(button);
+          clickVoice(button);
           assert.strictEqual(listenCount, 4);
-          assert.strictEqual(staleAudio.paused, true);
-          assert.strictEqual(revokedUrls.filter(url => url === 'blob:voice-2').length, 1);
-          staleAudio.onended();
+          assert.strictEqual(staleAudio.stopped, true);
+          assert.strictEqual(staleAudio.disconnected, true);
+          staleEnded();
           assert.strictEqual(listenCount, 4);
-          assert.strictEqual(revokedUrls.filter(url => url === 'blob:voice-2').length, 1);
-          button.onclick();
-          captureOptions.onTranscript('ghost turn', 'session-a');
-          assert.strictEqual(sendCount, 2);
-          button.onclick();
+          clickVoice(button);
+          audioContext.state = 'suspended';
+          failResume = true;
+          clickVoice(button);
           assert.strictEqual(listenCount, 5);
+          captureOptions.onTranscript('playback failure', 'session-a');
+          assert.strictEqual(sendCount, 3);
+          window.autoReadLastAssistant();
+          await new Promise(resolve => setImmediate(resolve));
+          await new Promise(resolve => setImmediate(resolve));
+          assert.ok(toasts.some(message => message.includes('OpenAI TTS error: playback denied')));
+          assert.strictEqual(listenCount, 6);
+          clickVoice(button);
+          captureOptions.onTranscript('ghost turn', 'session-a');
+          assert.strictEqual(sendCount, 3);
+          failResume = false;
+          audioContext.state = 'running';
+          clickVoice(button);
+          assert.strictEqual(listenCount, 7);
           S.session.session_id = 'session-b';
           captureOptions.onSessionChange('session-a');
           captureOptions.onTranscript('wrong session', 'session-a');
-          assert.strictEqual(sendCount, 2);
+          assert.strictEqual(sendCount, 3);
           assert.strictEqual(window._voiceModeActive(), false);
-          assert.deepStrictEqual(listenedSessions, ['session-a', 'session-a', 'session-a', 'session-a', 'session-a']);
+          assert.deepStrictEqual(listenedSessions, ['session-a', 'session-a', 'session-a', 'session-a', 'session-a', 'session-a', 'session-a']);
         }})().catch(error => {{ console.error(error); process.exitCode = 1; }});
         """
     )

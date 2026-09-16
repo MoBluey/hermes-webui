@@ -66,7 +66,7 @@ def test_browser_tts_callbacks_and_deactivate_clear_recovery_handles():
     assert "_browserTtsSuppressNextErrorRearm=false;" in deactivate_body
 
 
-def test_edge_audio_branch_stays_separate():
+def test_edge_web_audio_branch_stays_separate():
     src = (REPO / "static" / "boot.js").read_text(encoding="utf-8")
     edge_match = re.search(
         r'if\(engine==="edge"\)\{(.*?)\n\s+return;\n\s+\}',
@@ -75,8 +75,8 @@ def test_edge_audio_branch_stays_separate():
     )
     assert edge_match, "Edge audio branch must exist"
     edge_body = edge_match.group(1)
-    assert "const audio = new Audio(url);" in edge_body
-    assert "audio.onended = () => {" in edge_body
+    assert "return r.arrayBuffer();" in edge_body
+    assert "_playVoiceModeAudioBuffer" in edge_body
     assert "_armBrowserTtsRecovery" not in edge_body, (
         "The browser speechSynthesis workaround must not be injected into the Edge audio branch."
     )
