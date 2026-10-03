@@ -1665,6 +1665,7 @@ window.renderTranscript=function(container, messages, opts){
   let _voiceModeStreamDone=false;
   let _voiceModeStreamSpoke=false;
   let _voiceModeTtsAbort=null;
+  let _voiceModeTtsPlayer=null;
   let _browserTtsKeepAlive=null;
   let _browserTtsWatchdog=null;
   let _browserTtsSuppressNextErrorRearm=false;
@@ -1965,6 +1966,10 @@ window.renderTranscript=function(container, messages, opts){
   }
 
   function _resetVoiceModeStream(){
+    if(_voiceModeTtsPlayer){
+      _voiceModeTtsPlayer.cancel();
+      _voiceModeTtsPlayer=null;
+    }
     if(_voiceModeTtsAbort){
       try{ _voiceModeTtsAbort.abort(); }catch(_){}
       _voiceModeTtsAbort=null;
@@ -2032,10 +2037,51 @@ window.renderTranscript=function(container, messages, opts){
       }).finally(()=>{ if(_voiceModeTtsAbort===controller) _voiceModeTtsAbort=null; });
   }
 
+  function _createVoiceModeOpenaiPlayer(generation,sessionId){
+    if(_ttsStreamPlayer) _ttsStreamPlayer.cancel();
+    const player=window.createHermesTtsPlayer({
+      context:_voiceModeAudioContext,
+      unlocked:Promise.resolve(_voiceModeAudioUnlock).then(error=>{if(error) throw error;}),
+      url:new URL('api/tts',document.baseURI||location.href).href,
+      isCurrent:()=>_voiceModeTtsPlayer===player&&_ttsStreamPlayer===player&&_voiceModeRunIsCurrent(generation,sessionId),
+    });
+    _voiceModeTtsPlayer=player;
+    _ttsStreamPlayer=player;
+    _ttsSpeaking=true;
+    _voiceModeSentenceRunning=true;
+    const settle=error=>{
+      if(_voiceModeTtsPlayer!==player) return;
+      if(_ttsStreamPlayer===player){_ttsStreamPlayer=null;_ttsSpeaking=false;}
+      _voiceModeSentenceRunning=false;
+      if(!_voiceModeRunIsCurrent(generation,sessionId)) return;
+      if(error) showToast('OpenAI TTS error: '+(error&&error.message||error),4000,'error');
+      _voiceModeThinkingSid=null;
+      _voiceModeStreamDone=false;
+      _voiceModeResumeAfterPlayback(generation,sessionId,error?1000:300);
+    };
+    player.done.then(()=>settle(),settle);
+    return player;
+  }
+
   function _drainVoiceModeSentences(){
-    if(_voiceModeSentenceRunning||!_voiceModeActive) return;
+    if(!_voiceModeActive) return;
     const sessionId=_voiceModeStreamSid;
     const generation=_voiceModeGeneration;
+    if((localStorage.getItem('hermes-tts-engine')||'browser')==='openai'){
+      if(!_voiceModeTtsPlayer&&_voiceModeSentenceQueue.length){
+        _voiceModeStreamSpoke=true;
+        _setState('speaking');
+        _createVoiceModeOpenaiPlayer(generation,sessionId);
+      }
+      if(_voiceModeTtsPlayer){
+        _voiceModeSentenceQueue.splice(0).forEach(sentence=>{
+          _splitForTTS(sentence).forEach(chunk=>_voiceModeTtsPlayer.enqueue(chunk));
+        });
+        if(_voiceModeStreamDone) _voiceModeTtsPlayer.finish();
+        return;
+      }
+    }
+    if(_voiceModeSentenceRunning) return;
     const sentence=_voiceModeSentenceQueue.shift();
     if(!sentence){
       if(_voiceModeStreamDone&&_voiceModeRunIsCurrent(generation,sessionId)){
@@ -2164,22 +2210,9 @@ window.renderTranscript=function(container, messages, opts){
       return;
     }
     if(engine==="openai"){
-      _ttsSpeaking=true;
-      fetch(new URL('api/tts', document.baseURI || location.href).href, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({text: clean, engine: 'openai'})
-      })
-      .then(r => {
-        if(!r.ok) throw new Error('TTS request failed: ' + r.status);
-        return r.arrayBuffer();
-      })
-      .then(buf => {
-        return _playVoiceModeAudioBuffer(buf,voiceGeneration,speakingSid,'OpenAI TTS');
-      })
-      .catch(error => {
-        _voiceModeSynthesisFailed(voiceGeneration,speakingSid,error,'OpenAI TTS');
-      });
+      const player=_createVoiceModeOpenaiPlayer(voiceGeneration,speakingSid);
+      _splitForTTS(clean).forEach(chunk=>player.enqueue(chunk));
+      player.finish();
       return;
     }
     if(engine==="edge"){

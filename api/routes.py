@@ -21483,6 +21483,49 @@ def _buffer_tts_audio_response(resp, *, max_bytes: int | None = None) -> bytes:
             raise ValueError("upstream audio exceeded byte limit")
     return bytes(audio_data)
 
+
+def _stream_tts_pcm_response(handler, resp, *, sample_rate):
+    """Relay PCM promptly; an unfinished chunked response signals midstream failure."""
+    content_type = str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    if content_type not in {"audio/pcm", "audio/raw"}:
+        raise ValueError("upstream returned a non-PCM audio format")
+    read = getattr(resp, "read1", resp.read)
+    chunk = read(4096)
+    if not chunk or len(chunk) > _TTS_PROXY_MAX_BYTES:
+        raise ValueError("invalid upstream PCM size")
+    handler.protocol_version = "HTTP/1.1"
+    handler.close_connection = True
+    handler.send_response(200)
+    handler.send_header("Content-Type", "audio/pcm")
+    handler.send_header("X-Audio-Format", "pcm_s16le")
+    handler.send_header("X-Audio-Sample-Rate", str(sample_rate))
+    handler.send_header("X-Audio-Channels", "1")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("X-Accel-Buffering", "no")
+    handler.send_header("Transfer-Encoding", "chunked")
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    total = 0
+    try:
+        while chunk:
+            total += len(chunk)
+            if total > _TTS_PROXY_MAX_BYTES:
+                raise ValueError("upstream audio exceeded byte limit")
+            handler.wfile.write(f"{len(chunk):X}\r\n".encode("ascii") + chunk + b"\r\n")
+            handler.wfile.flush()
+            chunk = read(4096)
+        if total % 2:
+            raise ValueError("upstream ended with an incomplete PCM sample")
+        handler.wfile.write(b"0\r\n\r\n")
+        handler.wfile.flush()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    except Exception:
+        # Headers/audio have already left. Never append JSON to the PCM stream.
+        # Closing without the terminal HTTP chunk makes fetch reject truncation.
+        logger.warning("OpenAI TTS PCM stream interrupted", exc_info=True)
+    return True
+
 class _NoRedirectTtsHandler(HTTPRedirectHandler):
     """Refuse to follow redirects on the TTS call.
 
@@ -21554,11 +21597,9 @@ def _handle_tts(handler, parsed):
     only its own thread during Microsoft network I/O + streaming; other clients
     are unaffected. Combined with early auth, a strict per-client 2 s rate
     limit, 5000-char cap, and voice allowlist, the blocking cost is bounded and
-    intentional. All audio chunks are buffered before sending so that a
-    Content-Length header can be included. The 5000-char cap bounds audio to
-    roughly 1-5 MB, making full buffering safe. Without Content-Length the
-    HTTP/1.0 server leaves the response open until a ~31 s timeout fires, and
-    the browser cannot play the blob mid-stream.
+    intentional. Encoded audio retains the bounded Content-Length response.
+    An explicitly configured PCM provider can use HTTP/1.1 chunked delivery;
+    each chunk is flushed and the connection closes when the request finishes.
     If the HTTP layer ever moves to asyncio we can adopt edge_tts's native
     async API at that time.
     """
@@ -21579,6 +21620,7 @@ def _handle_tts(handler, parsed):
         rate_str = _normalize_tts_prosody(data.get("rate"), unit="%")
         pitch_str = _normalize_tts_prosody(data.get("pitch"), unit="Hz")
         request_engine = data.get("engine")
+        stream_requested = data.get("stream") is True
         if "engine" not in data or (
             isinstance(request_engine, str) and not request_engine.strip()
         ):
@@ -21767,6 +21809,8 @@ def _handle_tts(handler, parsed):
         base_url = _urlunsplit(("https", "api.openai.com", "/v1", "", ""))
         model = "gpt-4o-mini-tts"
         oai_voice = "alloy"
+        stream_pcm = False
+        sample_rate = 24000
         try:
             from api.config import get_config
             tts_cfg = (get_config() or {}).get("tts", {})
@@ -21776,6 +21820,11 @@ def _handle_tts(handler, parsed):
                     base_url = _normalized_openai_tts_base_url(oai_cfg.get("base_url") or base_url)
                     model = oai_cfg.get("model") or model
                     oai_voice = oai_cfg.get("voice") or oai_voice
+                    stream_pcm = stream_requested and oai_cfg.get("streaming") is True
+                    if stream_pcm:
+                        sample_rate = oai_cfg.get("sample_rate", 24000)
+                        if type(sample_rate) is not int or not 8000 <= sample_rate <= 96000:
+                            raise ValueError("invalid PCM sample_rate")
                 else:
                     base_url = _normalized_openai_tts_base_url(base_url)
             else:
@@ -21787,16 +21836,19 @@ def _handle_tts(handler, parsed):
             pass
 
         url = f"{base_url}/audio/speech"
-        req_body = json.dumps({
+        speech_body = {
             "model": model,
             "input": text,
             "voice": oai_voice,
-        }).encode("utf-8")
+        }
+        if stream_pcm:
+            speech_body.update({"stream": True, "response_format": "pcm"})
+        req_body = json.dumps(speech_body).encode("utf-8")
 
         req = Request(url, data=req_body, headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "Accept": "audio/mpeg",
+            "Accept": "audio/pcm" if stream_pcm else "audio/mpeg",
         })
 
         # Use a pinned HTTPS opener so the resolved address is the one that gets
@@ -21806,6 +21858,8 @@ def _handle_tts(handler, parsed):
         # so their first socket read needs more time than a short cloud request.
         try:
             with _tts_open(req, timeout=180, opener_factory=lambda: build_opener(ProxyHandler({}), _NoRedirectTtsHandler(), _PinnedHTTPSHandler())) as resp:
+                if stream_pcm:
+                    return _stream_tts_pcm_response(handler, resp, sample_rate=sample_rate)
                 audio_data = _buffer_tts_audio_response(resp)
         except ValueError:
             logger.warning("OpenAI TTS rejected an invalid upstream response", exc_info=True)

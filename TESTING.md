@@ -33,6 +33,28 @@ including requests started without a session. The Node harness executes the
 real loaders with deferred responses and PDF-ready/timeout callbacks; it does
 not certify browser rendering or real CDN availability.
 
+## Streaming TTS playback
+
+Run `./scripts/test.sh tests/test_tts_streaming.py tests/test_issue4982_openai_tts.py tests/test_android_webview_voice_mode.py`.
+The transient browser speech player owns its requests, queued clips and scheduled
+audio. Tests cover incremental PCM framing, sample boundaries, one clip of
+lookahead, cancellation on Stop/session/profile changes, late responses and
+microphone reactivation only after the last clip ends.
+
+With a PCM-capable local provider configured as described in
+`docs/troubleshooting.md`, verify these in a real desktop and mobile browser:
+
+1. Read a long reply. Audio starts before the first response body finishes;
+   the next clip is requested while the previous clip plays.
+2. Stop, start a different reply, create/open another session and switch profiles.
+   Each action stops the old audio immediately and discards late responses.
+3. Use voice mode. The microphone remains off until all queued speech finishes.
+4. Interrupt the upstream stream using an isolated test provider. A truncated
+   HTTP body reports an error and stops queued audio instead of completing.
+
+The Node harness mocks Web Audio and cannot establish native autoplay, resampling
+or Fetch truncation behaviour. Verify those separately with actual browser APIs.
+
 ## Static JS runtime lint (brick-class regression guard)
 
 Some JS bugs throw a `TypeError`/`ReferenceError` only when a specific function

@@ -1996,6 +1996,7 @@ async function newSession(flash, options={}){
     if(typeof showToast==='function') showToast(_newSessionPendingText(),1500);
     return _newSessionInFlight;
   }
+  if(typeof stopTTS==='function')stopTTS();
   if(S.session&&typeof window._voiceModeActive==='function'&&window._voiceModeActive()
       &&typeof window._voiceModeDeactivate==='function'){
     window._voiceModeDeactivate();
@@ -2325,6 +2326,7 @@ async function loadSession(sid){
     }
     return;
   }
+  if(currentSid!==sid&&typeof stopTTS==='function')stopTTS();
   if(currentSid!==sid&&typeof window._voiceModeActive==='function'&&window._voiceModeActive()
       &&typeof window._voiceModeDeactivate==='function'){
     window._voiceModeDeactivate();

@@ -9456,6 +9456,7 @@ let _ttsChunkQueue=[];
 let _ttsChunkIndex=0;
 let _ttsActiveBtn=null;
 let _playingEdgeAudio=null;
+let _ttsStreamPlayer=null;
 
 function _buildBrowserUtterance(text, btn){
   const utter=new SpeechSynthesisUtterance(text);
@@ -9646,30 +9647,32 @@ function _playElevenLabsTts(text, btn){
 }
 
 function _playOpenaiTts(text, btn){
+  stopTTS();
   if(btn) btn.dataset.speaking='1';
   _ttsSpeaking=true;
-  const _fail=function(msg){
-    _ttsSpeaking=false;_playingEdgeAudio=null;
+  _ttsActiveBtn=btn;
+  const sessionId=(typeof S!=='undefined'&&S.session)?S.session.session_id:null;
+  const context=_getTtsAudioCtx(true);
+  const cleanup=function(){
+    if(_ttsStreamPlayer!==player) return;
+    _ttsStreamPlayer=null;
+    _ttsSpeaking=false;_ttsActiveBtn=null;
     if(btn)btn.dataset.speaking='0';
-    if(msg&&typeof showToast==='function') showToast(msg,4000,'error');
   };
-  fetch(new URL('api/tts', document.baseURI || location.href).href, {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({text:text, engine:'openai'})
-  })
-  .then(function(r){
-    if(!r.ok){
-      return r.json().catch(function(){return {};}).then(function(j){
-        throw new Error((j&&j.error)||('TTS request failed: '+r.status));
-      });
-    }
-    return r.arrayBuffer();
-  })
-  .then(function(buf){
-    return _playAudioBuf(buf, btn, 'OpenAI TTS');
-  })
-  .catch(function(e){ _fail((e&&e.message)||'OpenAI TTS failed'); });
+  const player=window.createHermesTtsPlayer({
+    context:context,
+    unlocked:context&&context.state==='suspended'?context.resume():Promise.resolve(),
+    url:new URL('api/tts',document.baseURI||location.href).href,
+    isCurrent:()=>_ttsStreamPlayer===player&&sessionId===((typeof S!=='undefined'&&S.session)?S.session.session_id:null),
+  });
+  _ttsStreamPlayer=player;
+  player.done.then(cleanup,error=>{
+    if(_ttsStreamPlayer===player&&typeof showToast==='function') showToast('OpenAI TTS error: '+(error&&error.message||error),4000,'error');
+    cleanup();
+  });
+  _splitForTTS(text).forEach(chunk=>player.enqueue(chunk));
+  player.finish();
+  return player.done;
 }
 
 // ── Shared AudioContext for TTS playback (no blob URLs needed) ──
@@ -9715,6 +9718,10 @@ function _playAudioBuf(arrayBuffer, btn, label){
   });
 }
 function stopTTS(){
+  if(_ttsStreamPlayer){
+    _ttsStreamPlayer.cancel();
+    _ttsStreamPlayer=null;
+  }
   if('speechSynthesis' in window){
     speechSynthesis.cancel();
   }
@@ -9733,6 +9740,7 @@ function stopTTS(){
   _ttsCurrentUtterance=null;
   _ttsChunkQueue=[];
   _ttsChunkIndex=0;
+  if(_ttsActiveBtn) _ttsActiveBtn.dataset.speaking='0';
   _ttsActiveBtn=null;
   // Reset all speaking buttons
   document.querySelectorAll('[data-speaking="1"]').forEach(btn=>{ btn.dataset.speaking='0'; });

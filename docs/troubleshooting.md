@@ -36,7 +36,36 @@ WebUI allows 180 seconds for an upstream socket operation, including waiting
 for the first audio chunk. This is a socket inactivity timeout, not a limit on
 the total audio duration. Check the WebUI error log for `TimeoutError`, then
 check the configured `tts.openai.base_url` server's synthesis time and queue.
-Requests still accept at most 5,000 characters and buffer at most 16 MiB of audio.
+Requests still accept at most 5,000 characters and at most 16 MiB of audio.
+
+### Earlier playback from a local streaming speech server
+
+OpenAI Read Aloud splits long replies at sentence boundaries into clips of at
+most 300 characters. Both Read Aloud and OpenAI voice mode generate one clip
+ahead during playback. Requests respect the existing two-second rate limit.
+
+For an MLX Audio-compatible server that supports `stream: true` and returns raw
+signed 16-bit little-endian mono PCM, enable streaming in the Hermes config:
+
+```yaml
+tts:
+  openai:
+    # Keep the existing base_url, model and voice.
+    streaming: true
+    sample_rate: 24000
+```
+
+Set `sample_rate` to the model's actual output rate (8,000–96,000 Hz). It defaults
+to 24,000 Hz. This is an explicit provider capability: leave `streaming` unset
+for providers that do not support these MLX Audio request options. Existing
+providers continue returning complete encoded clips.
+
+With streaming enabled, the WebUI relays PCM immediately using chunked HTTP
+and the browser schedules the samples through its existing AudioContext.
+Reverse proxies must allow this response to stream without buffering. Stop,
+voice-mode deactivation and session navigation cancel pending synthesis and
+scheduled playback. The microphone resumes only after the final clip finishes.
+An interrupted PCM response stops playback and reports an error.
 
 ## "AIAgent not available -- check that hermes-agent is on sys.path"
 

@@ -558,15 +558,3 @@ def test_openai_voice_placeholder_in_panels():
     src = (STATIC_DIR / "panels.js").read_text(encoding="utf-8")
     assert "engine==='openai'" in src
     assert 'OpenAI voice (server-configured)' in src
-
-
-def test_play_openai_tts_exists_in_ui_js():
-    src = (STATIC_DIR / "ui.js").read_text(encoding="utf-8")
-    assert 'function _playOpenaiTts(text, btn)' in src
-    assert "body:JSON.stringify({text:text, engine:'openai'})" in src
-
-
-def test_boot_js_handles_openai_engine():
-    src = (STATIC_DIR / "boot.js").read_text(encoding="utf-8")
-    assert 'if(engine==="openai")' in src
-    assert "body: JSON.stringify({text: clean, engine: 'openai'})" in src

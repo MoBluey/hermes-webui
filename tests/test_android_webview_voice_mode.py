@@ -386,6 +386,10 @@ def test_webview_voice_controller_transcribes_speaks_and_relistens() -> None:
         global.S = {{busy: false, session: {{session_id: 'session-a'}}}};
         global._ttsSpeaking = false;
         global._playingEdgeAudio = null;
+        global._ttsStreamPlayer = null;
+        window.createHermesTtsPlayer = require({str(ROOT / 'static' / 'tts_stream.js')!r});
+        const uiSource = require('fs').readFileSync({str(ROOT / 'static' / 'ui.js')!r}, 'utf8');
+        eval(uiSource.slice(uiSource.indexOf('function _splitForTTS('), uiSource.indexOf('let _ttsSpeaking=')));
         let sendCount = 0;
         global.send = () => sendCount++;
         const pendingEmptyTimers = [];
@@ -424,6 +428,7 @@ def test_webview_voice_controller_transcribes_speaks_and_relistens() -> None:
         let failResume = false;
         const audioContext = {{
           state: 'suspended',
+          currentTime: 0,
           destination: {{}},
           resume() {{
             assert.strictEqual(inGesture, true, 'AudioContext must be resumed by the voice-button gesture');
@@ -433,7 +438,7 @@ def test_webview_voice_controller_transcribes_speaks_and_relistens() -> None:
             return Promise.resolve();
           }},
           decodeAudioData(_buffer, success, failure) {{
-            success({{decoded: true}});
+            success({{decoded: true, duration: 1}});
           }},
           createBufferSource() {{
             source = {{
