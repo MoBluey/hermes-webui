@@ -164,6 +164,34 @@ def test_openai_tts_prefers_voice_tools_key_over_openai_key(monkeypatch):
     assert captured["auth"] == "Bearer sk-voice-tools"
 
 
+def test_openai_tts_waits_for_local_synthesis_longer_than_30_seconds(monkeypatch):
+    import api.config as config
+
+    def _slow_synthesis(req, *, timeout, opener_factory):
+        class _DelayedAudioResponse(_StreamOnceResponse):
+            def read(self, size=-1):
+                # Non-streaming local synthesis sends HTTP headers immediately,
+                # then needs 45 seconds before its first audio chunk is ready.
+                if timeout < 45:
+                    raise TimeoutError("timed out waiting for synthesized audio")
+                return super().read(size)
+
+        return _DelayedAudioResponse([b"complete-local-audio"], {"Content-Type": "audio/mp3"})
+
+    monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "local-voice-key")
+    monkeypatch.setattr(config, "get_config", lambda: {
+        "tts": {"openai": {"base_url": "http://127.0.0.1:8000/v1", "model": "local-tts", "voice": "local"}}
+    })
+    monkeypatch.setattr(routes, "_tts_open", _slow_synthesis)
+    h = _post({"text": "A long spoken reply", "engine": "openai"}, client="10.82.0.30")
+
+    routes._handle_tts(h, None)
+
+    assert h.status == 200
+    assert h.wfile.getvalue() == b"complete-local-audio"
+    assert h.sent_headers["Content-Length"] == str(len(b"complete-local-audio"))
+
+
 def test_openai_tts_config_overrides(monkeypatch):
     captured = {}
     import api.config as config

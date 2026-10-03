@@ -26,6 +26,18 @@ WebUI HTTP server. Investigate cron outcomes in the gateway's logs and the
 active Hermes home's `cron/executions.db`; WebUI access records show HTTP cron
 management requests, not every scheduled execution.
 
+## "OpenAI TTS generation failed" on long replies
+
+The OpenAI TTS engine also supports local OpenAI-compatible speech servers.
+Some servers send response headers immediately but synthesize the entire reply
+before sending audio. A short sentence can work while a longer reply times out.
+
+WebUI allows 180 seconds for an upstream socket operation, including waiting
+for the first audio chunk. This is a socket inactivity timeout, not a limit on
+the total audio duration. Check the WebUI error log for `TimeoutError`, then
+check the configured `tts.openai.base_url` server's synthesis time and queue.
+Requests still accept at most 5,000 characters and buffer at most 16 MiB of audio.
+
 ## "AIAgent not available -- check that hermes-agent is on sys.path"
 
 **Symptom.** WebUI starts, shows the chat interface, but every chat request fails immediately with this error in the response or the server log. As of v0.51.6 the error includes a diagnostic block with the running Python interpreter, the relevant `sys.path` entries, and the most-common fix; on older versions the message is bare.
