@@ -7962,6 +7962,10 @@ def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_file
             'is_cli_session': True,
             'read_only': True,
         })
+    if projects_dir is None:
+        from api.claude_code_bridge import merge_public_sessions
+
+        sessions = merge_public_sessions(sessions)
     sessions.sort(key=lambda s: s.get('last_message_at') or s.get('updated_at') or 0, reverse=True)
     return sessions
 
@@ -7971,6 +7975,13 @@ def get_claude_code_session_messages(sid, projects_dir: Path | str | None = None
     sid = str(sid or '')
     if not sid.startswith(f'{CLAUDE_CODE_SOURCE}_'):
         return []
+    if projects_dir is None:
+        from api.claude_code_bridge import load_claude_stores, resolve_session
+
+        if load_claude_stores():
+            descriptor = resolve_session(sid)
+            if descriptor is not None:
+                return list(descriptor.messages)
     for path in _iter_claude_code_jsonl_files(projects_dir) or []:
         if _claude_code_session_id(path) != sid:
             continue

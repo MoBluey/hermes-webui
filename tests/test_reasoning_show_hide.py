@@ -292,6 +292,11 @@ class TestReasoningCommand:
             "(effort now round-trips through /api/reasoning → config.yaml)"
         )
 
+    def test_cmd_reasoning_includes_active_model_context(self):
+        src = read('static/commands.js')
+        fn = function_body(src, 'cmdReasoning')
+        assert "Object.assign({effort:arg},_reasoningEffortContext())" in fn
+
     def test_cmd_reasoning_routes_display_through_api_reasoning(self):
         """show|hide|on|off must POST to /api/reasoning (config.yaml
         display.show_reasoning — the CLI's key) in addition to mirroring
@@ -375,6 +380,66 @@ class TestReasoningConfigHelpers:
             "agent.reasoning_effort must be persisted to config.yaml"
         )
 
+    def test_set_reasoning_effort_persists_model_specific_override(self, tmp_path, monkeypatch):
+        """The composer carries the active model, so its selection must update
+        that model's override without changing the profile-wide default."""
+        import api.config as cfg
+        import yaml as _yaml
+
+        cfgfile = tmp_path / 'config.yaml'
+        cfgfile.write_text(
+            "agent:\n"
+            "  reasoning_effort: xhigh\n"
+            "  reasoning_overrides:\n"
+            "    Qwen3.8-27B-AEON: low\n",
+            encoding='utf-8',
+        )
+        monkeypatch.setattr(cfg, '_get_config_path', lambda: cfgfile)
+        monkeypatch.setattr(cfg, 'reload_config', lambda: None)
+
+        status = cfg.set_reasoning_effort('none', model_id='Qwen3.8-27B-AEON')
+
+        data = _yaml.safe_load(cfgfile.read_text(encoding='utf-8'))
+        assert data['agent']['reasoning_effort'] == 'xhigh'
+        assert data['agent']['reasoning_overrides']['Qwen3.8-27B-AEON'] == 'none'
+        assert status['reasoning_effort'] == 'none'
+
+    def test_configured_reasoning_effort_prefers_model_override(self):
+        import api.config as cfg
+
+        config_data = {
+            'agent': {
+                'reasoning_effort': 'xhigh',
+                'reasoning_overrides': {'Qwen3.8-27B-AEON': 'low'},
+            },
+        }
+
+        assert cfg.configured_reasoning_effort_for_model(
+            config_data,
+            'Qwen3.8-27B-AEON',
+            provider_id='custom:qwen',
+        ) == 'low'
+
+    def test_qualified_picker_reasoning_reaches_bare_runtime(self, tmp_path, monkeypatch):
+        import api.config as cfg
+        import yaml
+
+        path = tmp_path / 'config.yaml'
+        path.write_text('agent:\n  reasoning_effort: high\n', encoding='utf-8')
+        monkeypatch.setattr(cfg, '_get_config_path', lambda: path)
+        monkeypatch.setattr(cfg, 'reload_config', lambda: None)
+        model = 'Qwen3.8-27B-AEON'
+        cfg.set_reasoning_effort('none', model_id=f'@custom:qwen:{model}')
+        saved = yaml.safe_load(path.read_text())
+        assert cfg.configured_reasoning_effort_for_model(saved, model, 'custom:qwen') == 'none'
+        assert cfg.configured_reasoning_effort_for_model(saved, model, 'custom:other') == 'high'
+        cfg.set_reasoning_effort('low', model_id=model, provider_id='custom:qwen')
+        saved = yaml.safe_load(path.read_text())
+        assert cfg.configured_reasoning_effort_for_model(saved, f'@custom:qwen:{model}') == 'low'
+        cfg.set_reasoning_effort('', model_id=model, provider_id='custom:qwen')
+        saved = yaml.safe_load(path.read_text())
+        assert cfg.configured_reasoning_effort_for_model(saved, model, 'custom:qwen') == 'high'
+
     def test_set_reasoning_display_persists_to_config_yaml(self, tmp_path, monkeypatch):
         """set_reasoning_display writes display.show_reasoning to the same
         config.yaml the CLI writes."""
@@ -427,13 +492,20 @@ class TestStreamingReasoningWiring:
             "api/streaming.py must import parse_reasoning_effort to translate "
             "config.yaml agent.reasoning_effort into AIAgent reasoning_config"
         )
-        assert 'coerce_reasoning_effort_for_model' in src, (
-            "api/streaming.py must clamp/drop unsupported model-specific effort "
-            "levels before sending reasoning_config to the provider"
+        assert 'configured_reasoning_effort_for_model' in src, (
+            "api/streaming.py must resolve per-model overrides before sending "
+            "reasoning_config to the provider"
         )
         assert "reasoning_config" in src and "'reasoning_config' in _agent_params" in src, (
             "api/streaming.py must guard the reasoning_config kwarg with "
             "inspect.signature so older hermes-agent builds don't TypeError"
+        )
+
+    def test_streaming_preserves_named_provider_for_reasoning_override(self):
+        src = read('api/streaming.py')
+        assert 'provider_id=(_session_requested_provider or resolved_provider)' in src, (
+            "direct streaming must use the provider identity captured before "
+            "custom:qwen is canonicalised to custom for transport"
         )
 
 

@@ -5938,6 +5938,60 @@ def coerce_reasoning_effort_for_model(
     return raw
 
 
+def _reasoning_model_identity(model_id, provider_id=None):
+    """Keep picker and runtime identities equivalent without crossing providers."""
+    model = str(model_id or "").strip()
+    parsed = _parse_provider_qualified_model_id(model)
+    if parsed:
+        model, provider_id = parsed
+    provider = str(provider_id or "").strip()
+    return model, provider, f"@{provider}:{model}" if provider and model else model
+
+
+def configured_reasoning_effort_for_model(
+    config_data: dict | None,
+    model_id: str | None = None,
+    provider_id: str | None = None,
+    base_url: str | None = None,
+) -> str:
+    """Resolve and coerce the configured effort for the active model."""
+    cfg = config_data if isinstance(config_data, dict) else {}
+    model_id, provider_id, override_key = _reasoning_model_identity(model_id, provider_id)
+    agent_cfg = cfg.get("agent")
+    overrides = agent_cfg.get("reasoning_overrides") if isinstance(agent_cfg, dict) else None
+    if not isinstance(overrides, dict) or override_key not in overrides:
+        override_key = model_id  # Legacy unqualified overrides remain model-wide.
+    try:
+        from hermes_constants import resolve_reasoning_config
+
+        resolved = resolve_reasoning_config(cfg, override_key)
+    except Exception:
+        agent_cfg = cfg.get("agent")
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
+        raw = agent_cfg.get("reasoning_effort", "")
+        overrides = agent_cfg.get("reasoning_overrides")
+        if override_key and isinstance(overrides, dict) and override_key in overrides:
+            candidate = parse_reasoning_effort(overrides[override_key])
+            if candidate is not None:
+                raw = overrides[override_key]
+        resolved = {"enabled": False} if raw is False else parse_reasoning_effort(raw)
+
+    if resolved is None:
+        return ""
+    raw_effort = (
+        "none"
+        if resolved.get("enabled") is False
+        else str(resolved.get("effort") or "")
+    )
+    return coerce_reasoning_effort_for_model(
+        raw_effort,
+        model_id,
+        provider_id=provider_id,
+        base_url=base_url,
+    )
+
+
 def get_reasoning_status(
     *,
     model_id: str | None = None,
@@ -5953,10 +6007,7 @@ def get_reasoning_status(
     """
     config_data = _load_yaml_config_file(_get_config_path())
     display_cfg = config_data.get("display") or {}
-    agent_cfg = config_data.get("agent") or {}
     show_raw = display_cfg.get("show_reasoning") if isinstance(display_cfg, dict) else None
-    effort_raw = agent_cfg.get("reasoning_effort") if isinstance(agent_cfg, dict) else None
-
     resolve_model = model_id
     resolve_provider = provider_id
     resolve_base_url = base_url
@@ -5990,8 +6041,8 @@ def get_reasoning_status(
         "show_reasoning": bool(show_raw) if isinstance(show_raw, bool) else True,
         # Report the COERCED effort so boot/status/chip read paths agree with
         # what streaming actually sends. (Codex review of the drop-max alignment.)
-        "reasoning_effort": coerce_reasoning_effort_for_model(
-            str(effort_raw or "").strip().lower(),
+        "reasoning_effort": configured_reasoning_effort_for_model(
+            config_data,
             resolve_model,
             provider_id=resolve_provider,
             base_url=resolve_base_url,
@@ -6109,9 +6160,11 @@ def set_reasoning_effort(
     provider_id: str | None = None,
     base_url: str | None = None,
 ) -> dict:
-    """Persist ``agent.reasoning_effort`` to the active profile's config.yaml.
+    """Persist reasoning effort to the active profile's config.yaml.
 
-    Mirrors CLI ``/reasoning <level>``: same key, same valid values
+    When *model_id* is provided, updates that model's
+    ``agent.reasoning_overrides`` entry. Otherwise it mirrors CLI
+    ``/reasoning <level>`` by updating the profile-wide key. Valid values are
     (``none`` | ``minimal`` | ``low`` | ``medium`` | ``high`` | ``xhigh`` | ``max``).
 
     An empty string is accepted as "clear the override" — it removes the
@@ -6135,7 +6188,17 @@ def set_reasoning_effort(
         agent_cfg = config_data.get("agent")
         if not isinstance(agent_cfg, dict):
             agent_cfg = {}
-        if raw:
+        _, _, resolved_model_id = _reasoning_model_identity(model_id, provider_id)
+        if resolved_model_id:
+            overrides = agent_cfg.get("reasoning_overrides")
+            if not isinstance(overrides, dict):
+                overrides = {}
+            if raw:
+                overrides[resolved_model_id] = raw
+            else:
+                overrides.pop(resolved_model_id, None)
+            agent_cfg["reasoning_overrides"] = overrides
+        elif raw:
             agent_cfg["reasoning_effort"] = raw
         else:
             # Clear the override so the provider default takes effect (the

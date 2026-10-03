@@ -13,6 +13,7 @@ const ICONS={
   spark:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.8l1.1 3.1 3.1 1.1-3.1 1.1L8 10.2 6.9 7.1 3.8 6l3.1-1.1z"/><path d="M12.5 9.5l.5 1.5 1.5.5-1.5.5-.5 1.5-.5-1.5-1.5-.5 1.5-.5z"/></svg>',
   link:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6.7 9.3a3 3 0 0 1 0-4.2l1.7-1.7a3 3 0 0 1 4.2 4.2l-1 1"/><path d="M9.3 6.7a3 3 0 0 1 0 4.2l-1.7 1.7a3 3 0 0 1-4.2-4.2l1-1"/></svg>',
   download:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M14 10.5v2.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-2.5"/><polyline points="4.5 7 8 10.5 11.5 7"/><line x1="8" y1="10.5" x2="8" y2="2"/></svg>',
+  terminal:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><polyline points="4.5 6 6.5 8 4.5 10"/><line x1="8" y1="10" x2="11.5" y2="10"/></svg>',
 };
 
 // Tracks which session_id is currently being loaded. Used to discard stale
@@ -1868,6 +1869,55 @@ function _clearEmptyComposerModelOverride(){
   _emptyComposerModelOverrideHost._emptyComposerModelOverride=null;
 }
 
+const _composerModelPickHost=typeof window!=='undefined'?window:globalThis;
+
+// Track explicit picker intent independently of S.session. During deletion the
+// picker can change both before and after the active session is cleared.
+function _rememberComposerModelPick(model, modelProvider){
+  const resolvedModel=String(model||'').trim();
+  if(!resolvedModel) return;
+  const previous=_composerModelPickHost._composerModelPick;
+  _composerModelPickHost._composerModelPick={
+    model:resolvedModel,
+    model_provider:modelProvider||null,
+    revision:(Number(previous&&previous.revision||0)||0)+1,
+  };
+}
+
+function _readComposerModelPick(){
+  const state=_composerModelPickHost._composerModelPick;
+  if(!state||!state.model) return null;
+  return {
+    model:String(state.model||''),
+    model_provider:state.model_provider||null,
+    revision:Number(state.revision||0)||0,
+  };
+}
+
+function _settleEmptyComposerModelAfterFinalSessionDelete(modelPickRevisionAtDelete){
+  const currentPick=typeof _readComposerModelPick==='function'
+    ? _readComposerModelPick()
+    : null;
+  const currentRevision=Number(currentPick&&currentPick.revision||0)||0;
+  const preservePick=currentPick&&currentRevision!==(Number(modelPickRevisionAtDelete||0)||0);
+  const model=String(preservePick?currentPick.model:(window._defaultModel||'')).trim();
+  const provider=preservePick?currentPick.model_provider:(window._activeProvider||null);
+  if(preservePick){
+    if(typeof _rememberEmptyComposerModelOverride==='function'){
+      _rememberEmptyComposerModelOverride(model,provider);
+    }
+  }else if(typeof _clearEmptyComposerModelOverride==='function'){
+    _clearEmptyComposerModelOverride();
+  }
+  const modelSel=$('modelSelect');
+  if(!model||!modelSel) return null;
+  const applied=typeof _ensureModelOptionInDropdown==='function'
+    ? _ensureModelOptionInDropdown(model,modelSel,provider)
+    : (typeof _applyModelToDropdown==='function'?_applyModelToDropdown(model,modelSel,provider):null);
+  if(applied&&typeof syncReasoningChip==='function') syncReasoningChip();
+  return applied;
+}
+
 let _newSessionWorkspaceAnnouncementClearTimer=null;
 
 function _setNewSessionWorkspaceCue(message){
@@ -1945,6 +1995,10 @@ async function newSession(flash, options={}){
   if(_newSessionInFlight){
     if(typeof showToast==='function') showToast(_newSessionPendingText(),1500);
     return _newSessionInFlight;
+  }
+  if(S.session&&typeof window._voiceModeActive==='function'&&window._voiceModeActive()
+      &&typeof window._voiceModeDeactivate==='function'){
+    window._voiceModeDeactivate();
   }
   _setNewSessionPending(true);
   _newSessionInFlight=(async()=>{
@@ -2266,6 +2320,11 @@ async function loadSession(sid){
     }
     return;
   }
+  if(currentSid!==sid&&typeof window._voiceModeActive==='function'&&window._voiceModeActive()
+      &&typeof window._voiceModeDeactivate==='function'){
+    window._voiceModeDeactivate();
+  }
+  if(typeof syncClaudeTerminalNavigation==='function')syncClaudeTerminalNavigation(sid);
   // Mark this session as the in-flight load. Subsequent loadSession() calls
   // will overwrite this; stale awaits use the mismatch to bail out (#1060).
   const _loadGeneration = ++_loadSessionGeneration;
@@ -4912,6 +4971,10 @@ function _renderBatchActionBar(){
       danger:true
     });
     if(!ok)return;
+    const modelPickAtDelete=typeof _readComposerModelPick==='function'
+      ? _readComposerModelPick()
+      : null;
+    const modelPickRevisionAtDelete=Number(modelPickAtDelete&&modelPickAtDelete.revision||0)||0;
     try{
       const results=await Promise.all(ids.map(async sid=>{
         const response=await api('/api/session/delete',{method:'POST',body:JSON.stringify({session_id:sid})});
@@ -4925,7 +4988,10 @@ function _renderBatchActionBar(){
         if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(null);
         const remaining=await api('/api/sessions'+_sessionListQueryString());
         if(remaining.sessions&&remaining.sessions.length){await loadSession(remaining.sessions[0].session_id);}
-        else{$('msgInner').innerHTML='';$('emptyState').style.display='';}
+        else{
+          _settleEmptyComposerModelAfterFinalSessionDelete(modelPickRevisionAtDelete);
+          $('msgInner').innerHTML='';$('emptyState').style.display='';
+        }
       }
       if(cleanupFailedCount) showToast(t('delete_failed')+' ('+cleanupFailedCount+'/'+ids.length+')',0,'error');
       else showToast((retainedCount?t('session_deleted_worktree'):t('session_delete'))+' ('+ids.length+')');
@@ -5437,6 +5503,58 @@ async function _archiveSession(session, archived=true, beforeListRender=null){
   }catch(err){if(renderHold) await renderHold.catch(()=>{});_pendingSessionReflowPositions=null;showToast(t('session_archive_failed')+err.message);return false;}
 }
 
+function _claudeResumeActionLabel(profile){
+  if(profile==='qwen') return t('claude_resume_qwen');
+  if(profile==='ornith') return t('claude_resume_ornith');
+  return '';
+}
+
+function _setClaudeResumeActionState(action,label,enabled){
+  if(!action)return;
+  const name=action.querySelector('.ws-opt-name');
+  if(name)name.textContent=label;
+  action.disabled=!enabled;
+  action.classList.toggle('is-disabled',!enabled);
+  action.setAttribute('aria-disabled',enabled?'false':'true');
+}
+
+function _appendClaudeResumeAction(menu,session){
+  if(!menu||!session||session.kind!=='claude_code')return null;
+  const initialLabel=_claudeResumeActionLabel(session.claude_profile)||t('claude_resume_unavailable');
+  let canResume=false;
+  const action=_buildSessionAction(
+    initialLabel,
+    '',
+    ICONS.terminal,
+    ()=>{
+      if(!canResume)return;
+      closeSessionActionMenu();
+      return resumeClaudeSession(session);
+    }
+  );
+  _setClaudeResumeActionState(action,initialLabel,false);
+  menu.appendChild(action);
+  if(!_claudeResumeActionLabel(session.claude_profile)||!session.can_remote_resume)return action;
+  api('/api/claude-code/status?session_id='+encodeURIComponent(session.session_id)).then(status=>{
+    const label=status&&status.kind==='claude_code'
+      ?_claudeResumeActionLabel(status.claude_profile)
+      :'';
+    if(!label||!status.can_remote_resume){
+      _setClaudeResumeActionState(action,label||t('claude_resume_unavailable'),false);
+      return;
+    }
+    if(status.coarse_status==='active_elsewhere'){
+      _setClaudeResumeActionState(action,t('claude_active_elsewhere'),false);
+      return;
+    }
+    canResume=status.coarse_status==='inactive'||status.coarse_status==='active_here';
+    _setClaudeResumeActionState(action,label,canResume);
+  }).catch(()=>{
+    _setClaudeResumeActionState(action,initialLabel,false);
+  });
+  return action;
+}
+
 function _openSessionActionMenu(session, anchorEl){
   const isReadOnly = _isReadOnlySession(session);
   if(_sessionActionMenu && _sessionActionSessionId===session.session_id && _sessionActionAnchor===anchorEl){
@@ -5453,6 +5571,7 @@ function _openSessionActionMenu(session, anchorEl){
   menu.setAttribute('role','menu');
   menu.setAttribute('aria-label', 'Conversation actions');
   _appendSessionCopyLinkAction(menu, session);
+  _appendClaudeResumeAction(menu, session);
   if(isReadOnly){
     _appendSessionExportHtmlAction(menu, session);
     _mountSessionActionMenu(menu, session, anchorEl);
@@ -9855,6 +9974,10 @@ async function deleteSession(sid, beforeDelete=null){
     danger:true
   });
   if(!ok)return false;
+  const modelPickAtDelete=typeof _readComposerModelPick==='function'
+    ? _readComposerModelPick()
+    : null;
+  const modelPickRevisionAtDelete=Number(modelPickAtDelete&&modelPickAtDelete.revision||0)||0;
   const reflowPositions=_captureSessionReflowPositions();
   const beforeDeleteHold=beforeDelete?Promise.resolve().then(beforeDelete):null;
   const previousSessions=_allSessions;
@@ -9898,6 +10021,7 @@ async function deleteSession(sid, beforeDelete=null){
     if(remaining.sessions&&remaining.sessions.length){
       await loadSession(remaining.sessions[0].session_id);
     }else{
+      _settleEmptyComposerModelAfterFinalSessionDelete(modelPickRevisionAtDelete);
       const _tt=$('topbarTitle');if(_tt)_tt.textContent=assistantDisplayName();
       const _tm=$('topbarMeta');if(_tm)_tm.textContent='Start a new conversation';
       $('msgInner').innerHTML='';

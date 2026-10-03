@@ -243,12 +243,15 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Syntax highlighted code preview (Prism.js)
 
 ### Voice input
-- Microphone button in the composer (Web Speech API)
+- Microphone button in the composer (Web Speech API or MediaRecorder with configured server STT)
 - Tap to record, tap again or send to stop
 - Live interim transcription appears in the textarea
 - Auto-stops after ~2s of silence
 - Appends to existing textarea content (doesn't replace)
-- Hidden when browser doesn't support Web Speech API (Chrome, Edge, Safari)
+- Optional hands-free mode listens and submits after silence; server TTS speaks completed prose sentences as the reply streams, while browser TTS reads the completed reply using its recovery watchdog
+- Hands-free mode listens again only after the reply and speech queue finish
+- Changing chats while server transcription is pending ends hands-free mode and discards the old chat's result
+- Voice controls require microphone permission and either HTTPS or a loopback origin; unsupported controls stay hidden
 
 ### Profiles
 - Profile chip in the **composer footer** -- dropdown showing all profiles with gateway status and model info

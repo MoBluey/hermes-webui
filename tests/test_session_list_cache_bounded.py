@@ -147,6 +147,25 @@ def test_sidebar_field_allowlist_has_one_authority():
     assert cache._session_list_cache_sidebar_fields() is fields
 
 
+def test_bridge_controls_survive_cache_and_sidebar_projection():
+    row = {
+        "session_id": "claude_code_bridge",
+        "kind": "claude_code",
+        "label": "Claude Qwen",
+        "can_remote_resume": True,
+        "workspace_label": "Project",
+        "claude_profile": "qwen",
+        "read_only": True,
+    }
+    bounded = cache._session_list_cache_bounded_payload({
+        "sessions": [{**row, "messages": [{"content": "private"}]}],
+    })
+    assert bounded["sessions"] == [row]
+    projected = routes._sidebar_session_response_item(row, redact_enabled=False)
+    for key, value in row.items():
+        assert projected[key] == value
+
+
 def test_sidebar_compact_omits_heavy_session_metadata():
     session = Session(
         session_id="heavy",

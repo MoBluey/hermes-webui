@@ -95,7 +95,6 @@ try:
     import resource
 except ImportError:  # pragma: no cover - resource is Unix-only
     resource = None
-from urllib.parse import urlparse
 
 # Agent's isolated interpreter relaunch uses runpy.run_path(), which does not
 # put this script's directory on sys.path. Restore it before local imports.
@@ -107,6 +106,7 @@ activate_managed_agent()
 
 logger = logging.getLogger(__name__)
 
+from api import claude_code_request
 from api.request_logging import emit_request_log
 from api.auth import check_auth_or_close, reset_trusted_auth_request_state
 from api.config import HOST, PORT, STATE_DIR, SESSION_DIR, DEFAULT_WORKSPACE
@@ -300,7 +300,7 @@ class QuietHTTPServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(claude_code_request.ClaudeCodeRequestMixin, BaseHTTPRequestHandler):
     # HTTP/1.1 keep-alive stays on, so every response must declare framing.
     protocol_version = "HTTP/1.1"
     timeout = 30  # seconds — kills idle/incomplete connections to prevent thread exhaustion
@@ -370,7 +370,7 @@ class Handler(BaseHTTPRequestHandler):
             'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'remote': remote,
             'method': getattr(self, 'command', None) or '-',
-            'path': getattr(self, 'path', None) or '-',
+            'path': claude_code_request.request_log_path(self),
             'status': int(code) if str(code).isdigit() else code,
             'ms': duration_ms,
         }
@@ -381,11 +381,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self._req_t0 = time.time(); reset_trusted_auth_request_state(self)
+        parsed = claude_code_request.prepare_claude_code_request(self)
         cookie_profile = get_profile_cookie(self)
         if cookie_profile:
             set_request_profile(cookie_profile)
         try:
-            parsed = urlparse(self.path)
             # Body-pending-aware: a body-bearing GET failing auth would poison reuse (#7550).
             if not check_auth_or_close(self, parsed): return
             result = handle_get(self, parsed)
@@ -395,7 +395,7 @@ class Handler(BaseHTTPRequestHandler):
             # Expected disconnect path; do not convert it into a misleading server 500.
             return
         except Exception:
-            self._safe_webui_print(f'[webui] ERROR {self.command} {self.path}\n' + traceback.format_exc())
+            claude_code_request.log_request_error(self, traceback.format_exc())
             try:
                 j(self, {'error': 'Internal server error'}, status=500)
             except _CLIENT_DISCONNECT_ERRORS:
@@ -407,11 +407,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_write(self, route_func) -> None:
         self._req_t0 = time.time(); reset_trusted_auth_request_state(self)
+        parsed = claude_code_request.prepare_claude_code_request(self)
         cookie_profile = get_profile_cookie(self)
         if cookie_profile:
             set_request_profile(cookie_profile)
         try:
-            parsed = urlparse(self.path)
             _is_csp_report_post = parsed.path == "/api/csp-report" and self.command == "POST"
             if not _is_csp_report_post and not check_auth_or_close(self, parsed): return
             result = route_func(self, parsed)
@@ -421,7 +421,7 @@ class Handler(BaseHTTPRequestHandler):
             # Expected disconnect path; do not convert it into a misleading server 500.
             return
         except Exception:
-            self._safe_webui_print(f'[webui] ERROR {self.command} {self.path}\n' + traceback.format_exc())
+            claude_code_request.log_request_error(self, traceback.format_exc())
             try:
                 j(self, {'error': 'Internal server error'}, status=500)
             except _CLIENT_DISCONNECT_ERRORS:

@@ -5,6 +5,7 @@ import base64 as _base64
 import binascii as _binascii
 import errno
 import functools
+import hashlib as _hashlib
 import json as _json
 import logging
 import os
@@ -305,7 +306,10 @@ def _security_headers(handler):
     handler._csp_extra_frame_src = extra_frame_src
     handler.send_header('X-Content-Type-Options', 'nosniff')
     handler.send_header('X-Frame-Options', 'DENY')
-    handler.send_header('Referrer-Policy', 'same-origin')
+    handler.send_header(
+        'Referrer-Policy',
+        getattr(handler, '_referrer_policy', 'same-origin'),
+    )
     handler.send_header(_CSP_HEADER_NAME, _build_csp_enforced_policy(extra_connect_src, extra_frame_src))
     handler.send_header(
         'Permissions-Policy',
@@ -562,6 +566,97 @@ def flush_pending_auth_cookies(handler) -> None:
     handler._pending_set_cookies = []
     for cookie in pending:
         handler.send_header('Set-Cookie', cookie)
+
+
+_CLAUDE_TERMINAL_CAPABILITY_OPERATIONS = frozenset(
+    {"stream", "input", "resize", "stop"}
+)
+_CLAUDE_TERMINAL_CAPABILITY_COOKIE_PREFIX = "hermes_claude_"
+_CLAUDE_TERMINAL_CAPABILITY_COOKIE_PATH = "/api/claude-code"
+_CLAUDE_TERMINAL_CAPABILITY_MAX_AGE = 10 * 60
+
+
+def claude_terminal_capability_cookie_name(
+    handle: str,
+    generation: str,
+    operation: str,
+) -> str:
+    if not isinstance(handle, str) or not handle.strip():
+        raise ValueError("invalid terminal handle")
+    if not isinstance(generation, str) or not generation.strip():
+        raise ValueError("invalid terminal generation")
+    if not isinstance(operation, str):
+        raise ValueError("invalid terminal capability operation")
+    handle = handle.strip()
+    generation = generation.strip()
+    operation = operation.strip().lower()
+    if operation not in _CLAUDE_TERMINAL_CAPABILITY_OPERATIONS:
+        raise ValueError("invalid terminal capability operation")
+    scope = _hashlib.sha256(
+        f"{len(handle)}:{handle}{len(generation)}:{generation}:{operation}".encode(
+            "utf-8"
+        )
+    ).hexdigest()[:24]
+    return f"{_CLAUDE_TERMINAL_CAPABILITY_COOKIE_PREFIX}{operation}_{scope}"
+
+
+def queue_claude_terminal_capability_cookie(
+    handler,
+    handle: str,
+    generation: str,
+    operation: str,
+    capability: str,
+) -> None:
+    """Queue one operation-bound managed-terminal capability cookie."""
+    import http.cookies as _hc
+
+    from api.auth import _is_secure_context
+
+    name = claude_terminal_capability_cookie_name(
+        handle,
+        generation,
+        operation,
+    )
+    cookie = _hc.SimpleCookie()
+    cookie[name] = str(capability or "")
+    cookie[name]["path"] = _CLAUDE_TERMINAL_CAPABILITY_COOKIE_PATH
+    cookie[name]["httponly"] = True
+    cookie[name]["samesite"] = "Strict"
+    cookie[name]["max-age"] = str(_CLAUDE_TERMINAL_CAPABILITY_MAX_AGE)
+    if _is_secure_context(handler):
+        cookie[name]["secure"] = True
+    pending = getattr(handler, "_pending_set_cookies", None)
+    if pending is None:
+        pending = []
+        handler._pending_set_cookies = pending
+    pending.append(cookie[name].OutputString())
+
+
+def get_claude_terminal_capability_cookie(
+    handler,
+    handle: str,
+    generation: str,
+    operation: str,
+) -> str | None:
+    """Read one operation-bound capability without accepting URL/body secrets."""
+    import http.cookies as _hc
+
+    raw = handler.headers.get("Cookie", "")
+    if not raw:
+        return None
+    cookie = _hc.SimpleCookie()
+    try:
+        cookie.load(raw)
+    except _hc.CookieError:
+        return None
+    morsel = cookie.get(
+        claude_terminal_capability_cookie_name(
+            handle,
+            generation,
+            operation,
+        )
+    )
+    return morsel.value if morsel and morsel.value else None
 
 
 def _accepts_gzip(handler) -> bool:

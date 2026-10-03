@@ -52,7 +52,7 @@ def _clean(monkeypatch):
         sids = list(terminal._TERMINALS)
     for sid in sids:
         try:
-            terminal.close_terminal(sid)
+            terminal._close_registered_terminal(sid, allow_managed=True)
         except Exception:
             pass
 
@@ -117,6 +117,104 @@ def test_reaps_dead_process_regardless(monkeypatch):
     _make_registered_term(monkeypatch, "dead", alive=False, unwatched_since=None)
     victims = {sid for sid, _ in terminal._terminals_to_reap(now)}
     assert "dead" in victims
+
+
+def test_unwatched_busy_managed_terminal_survives_generic_grace(monkeypatch):
+    now = 100_000.0
+    term = _make_registered_term(
+        monkeypatch,
+        "managed-busy",
+        alive=True,
+        unwatched_since=now - terminal._TERMINAL_IDLE_GRACE_SECONDS - 1,
+    )
+    term.kind = "claude_code"
+    term.persistent_when_unwatched = True
+    term.last_activity = now - 1
+
+    victims = {sid for sid, _ in terminal._terminals_to_reap(now)}
+
+    assert "managed-busy" not in victims
+
+
+def test_managed_idle_uses_later_of_detach_and_last_io_activity(monkeypatch):
+    now = 200_000.0
+    term = _make_registered_term(
+        monkeypatch,
+        "managed-idle",
+        alive=True,
+        unwatched_since=now - terminal._MANAGED_TERMINAL_IDLE_SECONDS - 10,
+    )
+    term.kind = "claude_code"
+    term.persistent_when_unwatched = True
+    term.last_activity = now - 5
+
+    assert "managed-idle" not in {
+        sid for sid, _ in terminal._terminals_to_reap(now)
+    }
+
+    term.last_activity = now - terminal._MANAGED_TERMINAL_IDLE_SECONDS - 1
+    assert "managed-idle" in {
+        sid for sid, _ in terminal._terminals_to_reap(now)
+    }
+
+
+def test_completed_managed_input_wins_race_with_stale_idle_selection(monkeypatch):
+    now = time.time()
+    term = _make_registered_term(
+        monkeypatch,
+        "managed-input-race",
+        alive=True,
+        unwatched_since=now - terminal._MANAGED_TERMINAL_IDLE_SECONDS - 10,
+    )
+    term.kind = "claude_code"
+    term.handle = term.session_id
+    term.generation = "a2ac6402-0cc5-4c5e-9d21-593b84e27736"
+    term.pgid = term.proc.pid
+    term.persistent_when_unwatched = True
+    term.last_activity = now - terminal._MANAGED_TERMINAL_IDLE_SECONDS - 10
+    capability = terminal.issue_terminal_capability(
+        term.handle, term.generation, "input"
+    )
+    victims = terminal._terminals_to_reap(now)
+    assert [sid for sid, _term in victims] == [term.handle]
+
+    entered_write = threading.Event()
+    release_write = threading.Event()
+
+    def blocking_write(_fd, data):
+        entered_write.set()
+        assert release_write.wait(timeout=5)
+        return len(data)
+
+    monkeypatch.setattr(terminal.os, "write", blocking_write)
+    writer = threading.Thread(
+        target=terminal.write_managed_terminal,
+        kwargs={
+            "handle": term.handle,
+            "generation": term.generation,
+            "capability": capability,
+            "data": "input",
+        },
+    )
+    writer.start()
+    assert entered_write.wait(timeout=5)
+
+    result = {}
+
+    def claim():
+        result["claimed"] = terminal._claim_reap_victim(term.handle, term, now)
+
+    reaper = threading.Thread(target=claim)
+    reaper.start()
+    time.sleep(0.05)
+    release_write.set()
+    writer.join(timeout=5)
+    reaper.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert not reaper.is_alive()
+    assert result["claimed"] is None
+    assert terminal._TERMINALS.get(term.handle) is term
 
 
 # ── _reap_idle_terminals effect ──────────────────────────────────────────────

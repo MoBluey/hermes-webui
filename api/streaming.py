@@ -61,7 +61,7 @@ from api.config import (
     warm_models_catalog_provenance_if_cold,
     load_settings,
     parse_reasoning_effort,
-    coerce_reasoning_effort_for_model,
+    configured_reasoning_effort_for_model,
     _main_model_request_overrides,
     PROCESS_SESSION_INDEX, PROCESS_SESSION_INDEX_LOCK,
 )
@@ -12396,17 +12396,18 @@ def _run_agent_streaming(
             except Exception:
                 _max_tokens_cfg = None
 
-            # CLI-parity reasoning effort: read agent.reasoning_effort from the
-            # active profile's config.yaml (the same key the CLI writes via
-            # `/reasoning <level>`) and hand the parsed dict to AIAgent.  When
-            # the key is absent or invalid, pass None → agent uses its default.
+            # CLI-parity reasoning effort: resolve the active model's override,
+            # then fall back to the profile-wide agent.reasoning_effort.
             try:
-                _effort_cfg = _cfg.get('agent', {}) if isinstance(_cfg, dict) else {}
-                _effort_raw = _effort_cfg.get('reasoning_effort') if isinstance(_effort_cfg, dict) else None
-                _effort = coerce_reasoning_effort_for_model(
-                    _effort_raw,
+                _effort = configured_reasoning_effort_for_model(
+                    _cfg,
                     resolved_model,
-                    provider_id=resolved_provider,
+                    # Keep the picker identity for provider-qualified
+                    # overrides. Named custom providers are canonicalised to
+                    # ``custom`` for transport, but reasoning settings remain
+                    # keyed by their original slug (for example
+                    # ``custom:qwen``).
+                    provider_id=(_session_requested_provider or resolved_provider),
                     base_url=resolved_base_url,
                 )
                 _reasoning_config = parse_reasoning_effort(_effort)

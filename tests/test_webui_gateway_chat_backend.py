@@ -77,6 +77,21 @@ def test_gateway_chat_config_status_reports_fallback_api_server_key_without_expo
     assert "secret-token" not in repr(status)
 
 
+def test_gateway_reasoning_prefers_per_model_override():
+    cfg = {
+        "agent": {
+            "reasoning_effort": "xhigh",
+            "reasoning_overrides": {"Qwen3.8-27B-AEON": "low"},
+        },
+    }
+
+    assert gateway_chat._gateway_reasoning_effort_for_request(
+        cfg,
+        model="Qwen3.8-27B-AEON",
+        model_provider="custom:qwen",
+    ) == "low"
+
+
 def test_gateway_chat_backend_env_wins_over_config_and_stays_safe():
     assert webui_chat_backend_mode(
         {"webui_chat_backend": "gateway"},

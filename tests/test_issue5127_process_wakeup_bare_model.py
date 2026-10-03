@@ -9,6 +9,79 @@ from unittest.mock import patch
 
 
 class TestIssue5127CustomProviderBareSuffixRepair:
+    def test_profile_scoped_qualified_model_survives_cold_reload(self, monkeypatch):
+        """A valid named-custom session must not revert to the profile default."""
+        import api.config as config
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "ornith",
+                    "model": "ornith-aeon-35b-omlx-oq6e",
+                    "models": ["ornith-aeon-35b-omlx-oq6e"],
+                }
+            ]
+        }
+        monkeypatch.setattr(config, "cfg", {"model": {"provider": "openai-codex"}})
+        monkeypatch.setattr(
+            "api.routes.get_available_models",
+            lambda **_kwargs: {
+                "active_provider": "openai-codex",
+                "default_model": "gpt-5.6-luna",
+                "groups": [
+                    {
+                        "provider": "OpenAI Codex",
+                        "provider_id": "openai-codex",
+                        "models": [{"id": "gpt-5.6-luna", "label": "Luna"}],
+                    }
+                ],
+            },
+        )
+
+        result = _resolve_compatible_session_model_state(
+            "@custom:ornith:ornith-aeon-35b-omlx-oq6e",
+            "custom:ornith",
+            profile_config=profile_cfg,
+            prefer_cached_catalog=True,
+        )
+
+        assert result == (
+            "@custom:ornith:ornith-aeon-35b-omlx-oq6e",
+            "custom:ornith",
+            False,
+        )
+
+    def test_repairs_removed_qualified_model_to_same_custom_provider_default(self):
+        """A renamed local model must not remain routable only because its provider exists."""
+        from api.routes import _resolve_compatible_session_model_state
+
+        profile_cfg = {
+            "custom_providers": [
+                {
+                    "name": "ornith",
+                    "model": "ornith-aeon-35b-omlx-oq6e",
+                    "models": ["ornith-aeon-35b-omlx-oq6e"],
+                }
+            ]
+        }
+
+        with patch("api.routes.get_available_models") as mock_catalog:
+            result = _resolve_compatible_session_model_state(
+                "@custom:ornith:ornith-aeon-35b-q6",
+                "custom:ornith",
+                profile_config=profile_cfg,
+                explicit_model_pick=True,
+                prefer_cached_catalog=True,
+            )
+
+        assert mock_catalog.call_count == 0
+        assert result == (
+            "@custom:ornith:ornith-aeon-35b-omlx-oq6e",
+            "custom:ornith",
+            True,
+        )
+
     def test_fast_path_repairs_bare_suffix_to_profile_default(self):
         from api.routes import _resolve_compatible_session_model_state
 

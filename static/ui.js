@@ -9674,13 +9674,13 @@ function _playOpenaiTts(text, btn){
 
 // ── Shared AudioContext for TTS playback (no blob URLs needed) ──
 let _ttsAudioCtx=null;
-function _getTtsAudioCtx(){
+function _getTtsAudioCtx(skipResume){
   if(!_ttsAudioCtx){
     const C=window.AudioContext||window.webkitAudioContext;
     if(!C) return null;
     _ttsAudioCtx=new C();
   }
-  if(_ttsAudioCtx.state==='suspended') _ttsAudioCtx.resume();
+  if(_ttsAudioCtx.state==='suspended'&&!skipResume) _ttsAudioCtx.resume();
   return _ttsAudioCtx;
 }
 

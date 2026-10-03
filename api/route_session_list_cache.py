@@ -107,6 +107,12 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "read_only",
     "is_read_only",
     "gateway_routing",
+    # Browser-safe bridge controls must survive both caching and serialization.
+    "kind",
+    "label",
+    "can_remote_resume",
+    "workspace_label",
+    "claude_profile",
 }
 
 
